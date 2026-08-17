@@ -62,7 +62,8 @@ Configuration `M=1, B=1, H=8, d_k=64, K=4, L=4`, giving `N=8` streams and `S=64`
 Forward pass only.
 The notebook with these outputs is [`benchmarks/phase1_baseline.ipynb`](benchmarks/phase1_baseline.ipynb).
 
-At this configuration one timestep of `B_pref` costs `N * S * d_k * 4` bytes, so the scratch table grows about **128 KB per token**.
+At this configuration one timestep of `B_pref` costs `N * S * d_k * 4` bytes, so that one tensor grows by **128 KB per token**.
+That figure is arithmetic on the config, not a measurement; the measured number is below.
 
 ```
         T |    fwd ms |  peak GB |  M tok/s
@@ -80,8 +81,13 @@ At this configuration one timestep of `B_pref` costs `N * S * d_k * 4` bytes, so
 
 Three things to take from this.
 
-Peak memory is almost perfectly linear in `T`, doubling with every doubling of the sequence, exactly as the 128 KB-per-token arithmetic predicts.
-There is no quadratic term, so RACE's linear-time claim holds; the problem is the size of the constant.
+Peak memory is almost perfectly linear in `T`, doubling with every doubling of the sequence.
+Dividing peak by `T` gives 277 KB per token at T=4096 and still 277 KB per token at T=65536, so the constant is genuinely flat across a 16x range and there is no quadratic term.
+RACE's linear-time claim holds; the problem is the size of that constant.
+
+Worth noting that 277 KB is about 2.17x the 128 KB that a single `B_pref` costs, and the ratio holds to three significant figures at every length measured.
+`B_pref` alone does not explain the peak, but a small fixed number of same-shape tensors alive at once does, which is what the code does: the broadcast product, the `cumsum` result, `E_pref`, and the `.contiguous()` copy.
+This is consistent with the trace, though attributing the exact 2.17 to specific allocations would need a memory profile that has not been run yet.
 
 Throughput plateaus at about **5.25 M tokens/s** from T=16384 onward and does not improve with more work in flight.
 A compute-bound kernel would usually keep climbing as the sequence gets long enough to saturate the GPU.

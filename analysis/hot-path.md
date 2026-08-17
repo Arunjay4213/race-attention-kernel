@@ -132,9 +132,17 @@ The entire `[N, T, L, R, d_k]` table exists only to hand one `[N, S, d_k]` slice
 The `.contiguous()` on line 137 is worth flagging separately.
 `E_pref` is the result of a broadcast division and is not contiguous in the layout `bmm` wants, so this call allocates yet another full-size copy of the five-dimensional tensor at the moment of peak memory pressure.
 
-The arithmetic matches what the benchmark observes.
+The arithmetic lines up with what the benchmark observes.
 At the configuration used in the Phase 1 sweep (`M=1, B=1, H=8, d_k=64, K=4, L=4`, giving `N=8` streams and `S=64` buckets), one timestep of `B_pref` costs `N * S * d_k * 4` bytes, which is `8 * 64 * 64 * 4 = 131072` bytes, or 128 KB per token.
-Peak memory therefore grows by roughly a fixed amount per token with no dependence on anything else, which is the straight line in the Phase 1 memory plot and the reason a 40 GB A100 runs out at 131072 tokens.
+
+The measured peak is higher than that, and usefully so.
+Dividing the measured peak memory by `T` gives 277 KB per token, and it stays at 277 KB per token at every length in the sweep from T=4096 to T=65536.
+So peak memory really is a fixed cost per token with no dependence on anything else, which is the straight line in the Phase 1 memory plot and the reason a 40 GB A100 runs out at T=131072.
+
+The ratio of measured to single-tensor cost is 2.17, stable to three significant figures across a 16x range of sequence lengths.
+A single `B_pref` does not account for the peak, but a small fixed number of same-shape tensors alive simultaneously does, and that is exactly what lines 109, 110, and 137 create.
+I want to be careful here: the stability of that ratio is strong evidence that peak memory is dominated by a constant multiple of the `[N, T, L, R, d_k]` shape, but pinning 2.17 to a specific set of allocations would take a memory profile, which has not been run.
+The conclusion that does not depend on the profile is the one that matters for this project: whatever the exact multiple, all of it scales with a `T` axis that has no reader.
 
 Note that this is linear in `T`, not quadratic.
 RACE's linear-time claim is not in question here.
@@ -166,7 +174,7 @@ So there is no single place to fix this, and the causal copy in `misc/race.py` i
 | `kernels/gpu/*.cu` are unused at runtime | Confirmed. No build script, no Python bindings, no call sites. |
 | The real path is PyTorch `cumsum` + `matmul` | Confirmed. `misc/race.py:108-109` and `misc/race.py:135-138`. |
 | It materializes a large intermediate tensor | Confirmed. `B_pref` is 5-D, `[N, T, L, R, d_k]`, plus a same-shape broadcast product, `E_pref`, and a `.contiguous()` copy. |
-| That tensor is what caps context length | Consistent with measurement. 128 KB/token at the benchmark config; the A100-40GB sweep OOMs at T=131072. |
+| That tensor is what caps context length | Consistent with measurement. `B_pref` alone is 128 KB/token by arithmetic; measured peak is a flat 277 KB/token across a 16x range of `T`, and the A100-40GB sweep OOMs at T=131072. |
 
 The fused kernel this project is building targets `misc/race.py:108-138` as one operation.
 The reference `race_fused_fwd_cuda` at `kernels/gpu/forward_kernel.cu:19` shows the shape of the answer and is the natural starting point.
