@@ -114,7 +114,7 @@ Done.
 `src/bench_cpu_memory.py` shows the reference growing by about 267 KB per token in peak RSS while the chunked version stays flat.
 
 **Phase 3 - fused CUDA kernel.**
-Written, not yet run on a GPU.
+Running and measured; tensor-core version next.
 There are two causal kernels.
 `src/race_fused_fwd.cu` is the direct prototype: one block per stream, bucket state in shared memory, bf16 in and out, fp32 accumulation, no atomics.
 It removes the prefix tensor but walks each stream sequentially, so at the benchmarked config it keeps 8 of an A100's 108 SMs busy.
@@ -122,7 +122,7 @@ It removes the prefix tensor but walks each stream sequentially, so at the bench
 The design with the arithmetic behind the tile and sub-chunk sizes is in `docs/causal_v2_design.md`.
 
 **Non-causal forward and backward.**
-Written, not yet run on a GPU.
+Running and measured; tensor-core version next.
 `src/noncausal/` implements the paper's Algorithm 1 as three kernels (per-tile bucket build, fixed-order tree reduce, query pass) plus a five-launch backward with an `autograd.Function` wrapper.
 The corner probabilities use the exact product form φᵣ = ∏ₜ [pₜ or 1 − pₜ] with pₜ = σ(2βuₜ), so there is no length-R softmax anywhere.
 Every reduction is a fixed-shape tree, which makes forward and backward bitwise reproducible run to run.
@@ -131,11 +131,24 @@ The design is in `docs/noncausal_design.md`.
 
 ## Status
 
-Everything under `src/` compiles for sm_80, sm_89 and sm_90 with no register spills, and the CPU test suites pass: fp64 references, emulations of each kernel's exact summation order, and the derivation checks.
-What has not happened yet is a GPU run.
-The GPU tests are written and skip without CUDA; `infra/gpu_session.sh` runs the whole sequence (build, compute-sanitizer, tests, benchmarks, ncu) and collects the logs.
-Until that run exists, every performance statement in this repository is the Phase 1 baseline above, and the kernels' correctness rests on the CPU checks.
-Numbers will replace this paragraph when they are measured.
+Everything under `src/` has now run on three GPUs: an A10G, an L4, and an A100-SXM4-40GB, the same model as the Phase 1 baseline.
+All test suites pass on each (1268 non-causal, 773 causal on the A100), compute-sanitizer reports nothing, and every kernel compiles for sm_80, sm_86, sm_89 and sm_90 with no register spills.
+The full reports are [`benchmarks/a10g_first_run.md`](benchmarks/a10g_first_run.md) and [`benchmarks/a100_first_run.md`](benchmarks/a100_first_run.md).
+
+The headline against the baseline table above, on the A100-40GB where the reference runs out of memory at T = 131072:
+
+| causal forward, d = 64, P = 4, L = 4, 8 streams | T = 2097152 |
+|---|---|
+| chunk-parallel kernel (v2) | 91.9 ms, 8.13 GiB peak, 183 Mtok/s |
+| chunked PyTorch forward, fp32 | 3649 ms, 36.0 GiB peak |
+| one-block-per-stream prototype (v1) | 1.08 Mtok/s at every length |
+
+So the 2M-token forward runs in 8 GiB, 16× past the reference's wall, at about 40× the throughput of the memory-light PyTorch version and 170× the prototype.
+
+What is not there yet is bandwidth.
+On the A100 the non-causal forward reaches 38% of HBM peak at P = 2, L = 2 and 9% at P = 4, L = 4; the causal kernel sits at 9-13%.
+The profiles show why: at these configurations the hash projections, sigmoids, corner products and the R × d dot products are compute-bound on fp32 cores, which is what the regime analysis in `docs/` predicted.
+The three heavy stages are small matrix products over a tile of tokens, and moving them onto tensor cores is the next step.
 
 ## Credit
 
@@ -160,7 +173,8 @@ src/regime_analysis.py            FLOPs and bytes per token, roofline placement
 src/verify_factorization.py       numerical check of the Bernoulli product form
 src/noncausal/                    non-causal forward and backward: reference, kernels, binding, tests, benchmarks
 src/causal_v2/                    chunk-parallel causal forward: reference, kernels, binding, tests, benchmark
-infra/                            GPU session runbook and sanitizer cases
+infra/                            GPU runbook, sanitizer cases, SageMaker training-job runner
+benchmarks/                       Phase 1 notebook and the GPU run reports
 ```
 
 ## License
