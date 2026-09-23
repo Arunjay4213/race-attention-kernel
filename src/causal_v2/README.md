@@ -42,7 +42,7 @@ This is not the repo's per-bucket normalization (`src/race_baseline.py`); `refer
 The kernels include `src/noncausal/kernels/race_common.cuh` and `race_internal.cuh` by relative path; nothing under `src/noncausal/` is modified.
 
 Inputs: q, k, v are [B, H, T, d] bf16 contiguous CUDA tensors with identical shapes and 16-byte aligned data, W is [L, P, d] fp32, β is a one-element tensor (CPU or CUDA).
-Limits: d ∈ {64, 128}, P ∈ {1..5}, L ∈ {1..4}, B·H ≤ 65535, T ≤ 2³¹ − 4097, and the output pass must fit the GPU's shared memory (see below).
+Limits: d ∈ {64, 128}, P ∈ {1..5}, L ∈ {1..4}, B·H ≤ 65535, T ≤ 2³¹ − 4098, and the output pass must fit the GPU's shared memory (see below).
 Forward only: the binding is not an autograd function.
 
 ## Binding
@@ -235,11 +235,10 @@ The next steps are `ldmatrix` + `mma.sync` with documented fragment layouts (the
 
 ## Known untested
 
-- v2b has run only on an A10G (sm_86); sm_80, sm_89 and sm_90 are compiled but not run.
-  v2a has also run on an A100 (`benchmarks/a100_first_run.md`).
+- v2a and v2b have run on an A10G (sm_86), an L40S (sm_89) and an A100 (sm_80); sm_90 is compiled but not run.
+  See `benchmarks/a100_tensor_cores.md` and `benchmarks/l40s_run.md`.
 - v2b with the default hi/lo carry for d = 128, P = 5 with L ≥ 3 needs more than 99 KiB of shared memory and has only been compiled; its output pass without the register prefetch (`TcTraits::prefetch_rows`) has run on the A10G only in the single-carry build.
 - The v2b launch shapes were chosen from A10G measurements for the smallest per-SM shared memory of the targets; with 164 KiB (A100) or 228 KiB (H100) per SM, C = 64 with 2 CTAs per SM might be faster and has not been measured.
 - compute-sanitizer has run on the default build only, not on the single-carry build.
-- The performance of v2a is measured on the A10G only; the plan's predictions are for v2b.
 - The 2³¹-element offset test needs about 25 GB and is opt-in; it has not been run (the A10G has 24 GB).
 - β ≳ 30 gives non-finite outputs for some early tokens: Den can fall below 2⁻¹²⁸, where 1 / Den overflows to inf.

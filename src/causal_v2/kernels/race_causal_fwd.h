@@ -42,7 +42,7 @@
 // launchers; they must agree.
 //
 // Supported (both variants): D in {64, 128}, P in {1..5}, L in {1..4},
-// 1 <= T <= 2^31 - 4097, 1 <= BH <= 65535, and an output-pass shared-memory
+// 1 <= T <= 2^31 - 4098, 1 <= BH <= 65535, and an output-pass shared-memory
 // footprint within the device's opt-in limit (race_causal_output_fits).
 // q, k, v and out must be 16-byte aligned (the output pass uses 16-byte loads).
 // Each launcher returns the first CUDA error it hits (cudaErrorInvalidValue

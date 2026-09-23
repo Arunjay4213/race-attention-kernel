@@ -159,3 +159,4 @@ The kernels in `src/noncausal/kernels/` follow this design with these difference
   A and Den are summed on CUDA cores from the same rounded Φ, so the rounding perturbs convex weights instead of scaling O; `tests/numerics.py` derives the resulting bound.
   On the A10G it runs P = 4, L = 4 at 76% of HBM peak (N = 2²⁰, 4.4× the fp32-core path), and ncu shows both of its kernels memory-bound (82% to 86% DRAM throughput), as section 1 predicts.
   The fp32-core path stays the default and the backward is unchanged.
+- The per-token hash dot products use a `__shfl_xor_sync` butterfly, which leaves the sum in every lane, rather than the `__shfl_down_sync` tree named in section 3; the butterfly gives all lanes the same bitwise value, which the tensor-core and backward paths rely on.

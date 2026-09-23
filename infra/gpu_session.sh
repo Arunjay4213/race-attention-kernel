@@ -59,7 +59,7 @@ stage_build() {
 stage_sanitize() {
     # Small cases only (infra/sanitize_cases.py): the sanitizer tools are 10-100x slower than a plain run.
     if ! have compute-sanitizer; then skip sanitize "compute-sanitizer missing or broken"; return; fi
-    for tool in memcheck racecheck synccheck; do
+    for tool in memcheck racecheck synccheck initcheck; do
         run "sanitize_$tool" compute-sanitizer --tool "$tool" --error-exitcode 1 $PY infra/sanitize_cases.py
     done
 }
