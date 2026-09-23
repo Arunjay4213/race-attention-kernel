@@ -16,7 +16,12 @@ import os
 import pytest
 import torch
 
-from causal_numerics import assert_states_close, assert_within_rounding_floor, make_bf16_inputs
+from causal_numerics import (
+    ATOL_FACTOR,
+    assert_states_close,
+    assert_within_rounding_floor,
+    make_bf16_inputs,
+)
 from reference import race_causal_chunked_emulation, race_causal_reference
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
@@ -80,7 +85,9 @@ def test_forward_matches_reference(race, head_dim, num_planes, num_tables, seq_l
 def test_forced_tile_lengths_agree(race, head_dim, num_planes, num_tables, seq_len):
     # Tiles of C, 2C and 2048 tokens exercise the scan with many, some and one
     # tile; every run must pass the reference test, and runs with different
-    # summation orders must agree within one bf16 ulp.
+    # summation orders must agree within one bf16 ulp plus the fp32 allowance
+    # (outputs that nearly cancel to 0 have ulps far below fp32 noise; see
+    # causal_numerics.py).
     skip_unless_fits(race, head_dim, num_planes, num_tables)
     chunk = race.sub_chunk_tokens(head_dim, num_planes)
     q, k, v, W = make_bf16_inputs(case_seed(seq_len, head_dim, num_planes), 1, 3, seq_len,
@@ -92,9 +99,10 @@ def test_forced_tile_lengths_agree(race, head_dim, num_planes, num_tables, seq_l
         out = race.forward(q, k, v, W, torch.tensor(beta), tile_tokens=tile_tokens)
         assert_within_rounding_floor(out, ref, v, beta)
         outputs.append(out.double())
+    fp32_allowance = ATOL_FACTOR * max(1.0, beta) * v.double().abs().max().item()
     for other in outputs[1:]:
         ulp = torch.maximum(outputs[0].abs(), other.abs()) * 2.0**-7
-        assert ((outputs[0] - other).abs() <= ulp + 1e-30).all()
+        assert ((outputs[0] - other).abs() <= ulp + fp32_allowance).all()
 
 
 @pytest.mark.parametrize("seq_len", [1, 65, 2049, 20000])

@@ -31,6 +31,17 @@ Why this holds for a correct v2a and why it is tight:
   - a_rms = 1e-7 max|v| plays the same role for the RMS bound; an allowance of
     a's size would be 10-70% of F_rms at long T, where |O| is small.
 
+Agreement between tile lengths (test_forced_tile_lengths_agree). Runs with
+T_blk = C, 2C and 2048 sum the same terms in different orders, so their fp32
+values differ by fp32 noise and their bf16 outputs by at most one ulp, except
+where O nearly cancels to 0: there the noise is absolute (a few 2^-24 of
+max|v|) while the ulp scales with |O|. Measured on an A10G, over the
+test's grid, 511 of 1.9e7 compared elements more than one ulp apart, all at
+|O| between 1e-11 and 1e-6, with |O_1 - O_2| at most 1.15e-8 max|v|; so a
+pure one-ulp bound cannot hold. The check is one ulp plus the same a as
+above, which is still 870x above the worst measured difference and far below
+the 2^-7 |O| an actual scan or carry error produces at typical |O|.
+
 Bucket-state tolerance (debug prefix states, fp32 sums without output
 rounding), as in the non-causal suite: |X - X_ref| <= 3e-5 * scale + 1e-6 * T
 (times max|v| for B), where scale is the fp64 A entry. Sums of up to T_blk
