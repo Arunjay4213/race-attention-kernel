@@ -11,19 +11,30 @@ source file or a build flag changes. Its version check hashes the listed
 sources but not included headers, so a hash of the headers (including the
 non-causal ones the kernels include) is passed as a define to make header
 edits trigger a rebuild too.
+
+RACE_CAUSAL_PRECISE_CARRY=0 in the environment builds v2b with the single
+bf16 carry (docs/causal_v2_design.md section 6.3) as a separate extension,
+race_causal_v2_single_carry, so the two builds never replace each other in
+the cache. The default is the hi/lo carry.
 """
 from __future__ import annotations
 
 import functools
 import hashlib
+import os
 import pathlib
 from types import ModuleType
 
 KERNEL_DIR = pathlib.Path(__file__).resolve().parent / "kernels"
 NONCAUSAL_KERNEL_DIR = pathlib.Path(__file__).resolve().parents[1] / "noncausal" / "kernels"
-SOURCES = [KERNEL_DIR / "torch_binding.cpp", KERNEL_DIR / "race_causal_fwd.cu"]
+SOURCES = [
+    KERNEL_DIR / "torch_binding.cpp",
+    KERNEL_DIR / "race_causal_fwd.cu",
+    KERNEL_DIR / "race_causal_fwd_tc.cu",
+]
 HEADERS = [
     KERNEL_DIR / "race_causal_fwd.h",
+    KERNEL_DIR / "race_causal_internal.cuh",
     NONCAUSAL_KERNEL_DIR / "race_common.cuh",
     NONCAUSAL_KERNEL_DIR / "race_internal.cuh",
     NONCAUSAL_KERNEL_DIR / "race_fwd.h",
@@ -57,12 +68,16 @@ def load_extension(verbose: bool = True) -> ModuleType:
     """Compiles (if needed) and imports the extension; cached per process."""
     from torch.utils.cpp_extension import load
 
-    headers_define = f"-DRACE_HEADERS_DIGEST={_headers_digest()}"
+    precise_carry = os.environ.get("RACE_CAUSAL_PRECISE_CARRY", "1") != "0"
+    defines = [
+        f"-DRACE_HEADERS_DIGEST={_headers_digest()}",
+        f"-DRACE_CAUSAL_PRECISE_CARRY={int(precise_carry)}",
+    ]
     return load(
-        name="race_causal_v2",
+        name="race_causal_v2" if precise_carry else "race_causal_v2_single_carry",
         sources=[str(source) for source in SOURCES],
-        extra_cflags=CXX_FLAGS + [headers_define],
-        extra_cuda_cflags=CUDA_FLAGS + [headers_define],
+        extra_cflags=CXX_FLAGS + defines,
+        extra_cuda_cflags=CUDA_FLAGS + defines,
         extra_include_paths=[str(KERNEL_DIR)],
         verbose=verbose,
     )

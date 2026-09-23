@@ -8,8 +8,11 @@ The non-causal extension runs forward_train and then backward (with v as the
 output gradient) so the backward's per-warp scratch and __syncwarp ordering is
 checked too, and then the same with the tensor-core forward
 (tensor_cores=True), whose kernels stage every tile through shared memory
-with cp.async and several barriers per stage. Each call is checked for
-finiteness only; correctness is the test suites' job.
+with cp.async and several barriers per stage. The causal extension runs
+both of its variants: v2a (fp32 CUDA cores) and v2b (tensor_cores=True,
+whose per-warp scratch, in-place Phi writes and U tiles inside the scratch
+region are the shared-memory aliasing racecheck should see). Each call is
+checked for finiteness only; correctness is the test suites' job.
 
 Usage: python infra/sanitize_cases.py [noncausal] [causal_v2]
 With no arguments both extensions run; naming one runs only that one (and
@@ -51,7 +54,8 @@ CASES = [
     (1, 65, 128, 4, 3),     # L = 3 (state size not a multiple of the pass size), sub-chunk tail
     (4, 20000, 64, 4, 4),   # multi-level reduce / several tiles per stream
     (1, 2049, 128, 4, 4),   # largest d = 128 causal footprint that fits a 99 KB opt-in GPU (C = 32), tile tail
-    (1, 100, 64, 5, 4),     # largest causal footprint overall that fits 99 KB (84224 bytes, C = 32), sub-chunk tail
+    (1, 100, 64, 5, 4),     # largest causal v2a footprint that fits 99 KB (84224 bytes, C = 32), sub-chunk tail
+    (1, 300, 128, 5, 2),    # causal v2b with 16-warp CTAs in both kernels (d = 128, P = 5), sub-chunk tail
 ]
 
 
@@ -67,14 +71,20 @@ def main() -> None:
         if noncausal is not None:
             check_noncausal(noncausal, q, k, v, w, beta, (bh, n, d, p, l))
         if causal is not None:
-            try:
-                out = causal.forward(q, k, v, w, beta, 0)
-            except RuntimeError as err:  # configuration refused on this GPU (shared memory)
-                print(f"causal skipped {(bh, n, d, p, l)}: {str(err).splitlines()[0]}")
-                continue
-            torch.cuda.synchronize()
-            assert torch.isfinite(out).all(), f"causal non-finite at {(bh, n, d, p, l)}"
+            check_causal(causal, q, k, v, w, beta, (bh, n, d, p, l))
         print(f"ok {(bh, n, d, p, l)}")
+
+
+def check_causal(causal, q, k, v, w, beta, case) -> None:
+    for tensor_cores in (False, True):
+        label = "causal v2b" if tensor_cores else "causal v2a"
+        try:
+            out = causal.forward(q, k, v, w, beta, 0, tensor_cores)
+        except RuntimeError as err:  # configuration refused on this GPU (shared memory)
+            print(f"{label} skipped {case}: {str(err).splitlines()[0]}")
+            continue
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all(), f"{label} non-finite at {case}"
 
 
 def check_noncausal(noncausal, q, k, v, w, beta, case) -> None:

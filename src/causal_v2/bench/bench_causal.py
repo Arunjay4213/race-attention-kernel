@@ -1,13 +1,15 @@
-"""Timing of the causal RACE v2a forward against the HBM roofline and the PyTorch chunked forward.
+"""Timing of the causal RACE v2 forward against the HBM roofline and the PyTorch chunked forward.
 
 For each configuration and sequence length T (B * H = 8 streams):
-  - v2a: 5 warmup runs, then 20 timed runs with CUDA events; the median.
+  - the kernel (--variant v2a: fp32 CUDA cores, the default; v2b: bf16
+    tensor cores): 5 warmup runs, then 20 timed runs with CUDA events; the
+    median.
   - baseline: src/race_chunked.py chunked_forward (fp32, 4096-token chunks),
     1 warmup and 3 timed runs because it takes seconds at long T. It computes
     the repo's per-bucket normalization, not Algorithm 1, so it is a timing
     baseline only; its outputs are not compared.
 
-Bytes per token per stream (plan section 9):
+Bytes per token per stream (plan section 9), the same for both variants:
   - model   = 12 d (K1 reads K and V; K3 reads Q, K, V and writes O; all bf16)
               + 16 S (d + 1) / T_blk (the tile state: K1 write, K2 read and
               write, K3 read, fp32)
@@ -16,7 +18,7 @@ GB/s and % of peak use the model bytes; "min GB/s" uses the minimum bytes.
 Peak memory is torch.cuda.max_memory_allocated over the timed runs,
 including the inputs, so it states what a T-token forward needs.
 
-Usage: python bench/bench_causal.py [--min-log2 14] [--max-log2 21]
+Usage: python bench/bench_causal.py [--variant v2a|v2b] [--min-log2 14] [--max-log2 21]
        [--baseline-max-log2 21] [--skip-baseline]
 """
 from __future__ import annotations
@@ -92,11 +94,11 @@ def model_bytes(seq_len: int, head_dim: int, num_planes: int, num_tables: int, t
     return token_bytes + state_bytes
 
 
-def time_v2a(race, q, k, v, W, beta) -> tuple[float, float]:
-    """(median ms, peak GiB) of the v2a forward."""
+def time_forward(race, q, k, v, W, beta, tensor_cores: bool) -> tuple[float, float]:
+    """(median ms, peak GiB) of the v2a (tensor_cores=False) or v2b forward."""
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-    ms = median_ms(lambda: race.forward(q, k, v, W, beta), WARMUP_RUNS, TIMED_RUNS)
+    ms = median_ms(lambda: race.forward(q, k, v, W, beta, tensor_cores=tensor_cores), WARMUP_RUNS, TIMED_RUNS)
     return ms, torch.cuda.max_memory_allocated() / 2**30
 
 
@@ -126,6 +128,8 @@ def time_baseline(q, k, v, W) -> tuple[float, float] | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--variant", choices=["v2a", "v2b"], default="v2a",
+                        help="v2a: fp32 CUDA cores; v2b: bf16 tensor cores")
     parser.add_argument("--min-log2", type=int, default=14)
     parser.add_argument("--max-log2", type=int, default=21)
     parser.add_argument("--baseline-max-log2", type=int, default=21)
@@ -133,10 +137,12 @@ def main() -> None:
     args = parser.parse_args()
 
     race = load_extension(verbose=False)
+    tensor_cores = args.variant == "v2b"
     device_name = torch.cuda.get_device_name()
     peak = peak_bandwidth_gbps(device_name)
     print(f"device: {device_name}, peak HBM: {f'{peak:.0f} GB/s' if peak else 'unknown'}")
-    print(f"B*H={STREAMS}; v2a median of {TIMED_RUNS} after {WARMUP_RUNS} warmups; "
+    carry = f" (precise carry: {race.precise_carry()})" if tensor_cores else ""
+    print(f"B*H={STREAMS}; {args.variant}{carry} median of {TIMED_RUNS} after {WARMUP_RUNS} warmups; "
           f"baseline (race_chunked, fp32) median of {BASELINE_TIMED_RUNS} after {BASELINE_WARMUP_RUNS}")
     header = (f"{'d':>3} {'P':>2} {'L':>2} {'T':>8} {'T_blk':>5} {'ms':>9} {'Mtok/s':>8} {'GB/s':>7} "
               f"{'% peak':>7} {'min GB/s':>8} {'peak GiB':>8} {'base ms':>9} {'base GiB':>8} {'speedup':>8}")
@@ -145,7 +151,7 @@ def main() -> None:
 
     gen = torch.Generator(device="cuda").manual_seed(0)
     for head_dim, num_planes, num_tables in CONFIGS:
-        if not race.fits_on_device(head_dim, num_planes, num_tables):
+        if not race.fits_on_device(head_dim, num_planes, num_tables, tensor_cores):
             print(f"{head_dim:>3} {num_planes:>2} {num_tables:>2}  does not fit this GPU's shared memory")
             continue
         W = torch.randn(num_tables, num_planes, head_dim, device="cuda", generator=gen)
@@ -155,8 +161,9 @@ def main() -> None:
             shape = (1, STREAMS, seq_len, head_dim)
             q, k, v = (torch.randn(shape, device="cuda", generator=gen, dtype=torch.bfloat16)
                        for _ in range(3))
-            tile_tokens = race.select_tile_tokens(STREAMS, seq_len, head_dim, num_planes, num_tables)
-            ms, peak_gib = time_v2a(race, q, k, v, W, beta)
+            tile_tokens = race.select_tile_tokens(STREAMS, seq_len, head_dim, num_planes, num_tables,
+                                                  tensor_cores)
+            ms, peak_gib = time_forward(race, q, k, v, W, beta, tensor_cores)
             bytes_model = model_bytes(seq_len, head_dim, num_planes, num_tables, tile_tokens)
             gbps = bytes_model / (ms * 1e-3) / 1e9
             min_gbps = STREAMS * seq_len * 8 * head_dim / (ms * 1e-3) / 1e9

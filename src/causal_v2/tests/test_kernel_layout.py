@@ -1,8 +1,11 @@
-"""CPU checks of the v2a kernels' index math (kernels/race_causal_fwd.cu).
+"""CPU checks of the v2 kernels' index math (kernels/race_causal_fwd.cu for
+v2a, kernels/race_causal_fwd_tc.cu for v2b).
 
 No GPU is needed. Each test mirrors one mapping of the kernels and checks it
 covers its index space exactly once, or that a layout is aligned, disjoint and
-within the shared-memory limits:
+within the shared-memory limits.
+
+v2a:
   - the sub-chunk choice C(D, P) and the output-pass shared-memory layout,
   - step 1 loads: every (tensor, row, 16-byte vector) once,
   - step 2 features: every (side, table, token) once, one (side, table) per warp,
@@ -10,8 +13,15 @@ within the shared-memory limits:
     half-warps (the Den shuffle reduction relies on it),
   - step 6 update: every state element B[s][c] once, A[s] once,
   - the default tile length rule gives 2048 (config A) and 4096 (config B).
+v2b:
+  - the launch shapes (warps, C) of both kernels and the resulting residency,
+  - the shared-memory layout: 32-byte aligned, disjoint regions, wmma strides,
+    the U tiles inside the scratch region, the footprints,
+  - row staging, the Phi pairs, the G tiles, the output tiles (with the
+    balanced causal work of the mirrored rounds), the state tiles and the A
+    update groups: every index once, with the sharing the kernels rely on.
 
-The constants below mirror race_causal_fwd.cu and must be kept in sync.
+The constants below mirror the kernels and must be kept in sync.
 """
 from __future__ import annotations
 
@@ -209,3 +219,224 @@ def test_default_tile_lengths_match_the_plan():
         assert tile % sub_chunk(head_dim, num_planes) == 0
         state_bytes_per_token = 16 * (num_tables << num_planes) * (head_dim + 1) / tile
         assert tile == MAX_AUTO_TILE_TOKENS or state_bytes_per_token <= 0.05 * 12 * head_dim
+
+
+# ---------------------------------------------------------------------------
+# v2b (race_causal_fwd_tc.cu)
+# ---------------------------------------------------------------------------
+
+FRAG = 16
+SCRATCH_STRIDE = FRAG
+GRAM_TILE_STRIDE = FRAG + 8
+PORTABLE_SMEM_PER_SM = 100 * 1024
+RESERVED_SMEM_PER_CTA = 1024
+THREADS_PER_SM = 512
+
+
+def round_up16(n: int) -> int:
+    return (n + 15) & ~15
+
+
+def align32(n: int) -> int:
+    return (n + 31) & ~31
+
+
+def tc_smem_layout(head_dim: int, num_planes: int, num_tables: int, chunk: int, warps: int,
+                   emit_output: bool, precise_carry: bool = True) -> dict[str, tuple[int, int]]:
+    """(byte offset, byte length) of each non-empty region, mirroring tc_smem_layout."""
+    features_padded = round_up16(num_tables << num_planes)
+    plane_rows_padded = round_up16(num_tables * num_planes)
+    x_stride = max(head_dim, features_padded) + 8
+    value_stride = head_dim + 8
+    gram_tiles = (chunk // FRAG) * (chunk // FRAG + 1) // 2
+    gram_bytes = gram_tiles * FRAG * GRAM_TILE_STRIDE * 2 if emit_output else 0
+    sizes = [
+        ("x_q", chunk * x_stride * 2 if emit_output else 0),
+        ("x_k", chunk * x_stride * 2),
+        ("x_v", chunk * value_stride * 2),
+        ("planes_hi", plane_rows_padded * value_stride * 2),
+        ("planes_lo", plane_rows_padded * value_stride * 2),
+        ("gram_hi", gram_bytes),
+        ("gram_lo", gram_bytes),
+        ("carry_hi", head_dim * (features_padded + 8) * 2 if emit_output else 0),
+        ("carry_lo", head_dim * (features_padded + 8) * 2 if emit_output and precise_carry else 0),
+        ("mass", features_padded * 4),
+        ("scratch", warps * FRAG * SCRATCH_STRIDE * 4),
+    ]
+    layout, cursor = {}, 0
+    for name, size in sizes:
+        if size:
+            layout[name] = (cursor, size)
+        cursor += align32(size)
+    layout["total"] = (cursor, 0)
+    return layout
+
+
+def tc_smem_total(*args, **kwargs) -> int:
+    return tc_smem_layout(*args, **kwargs)["total"][0]
+
+
+def output_pass_launch(head_dim: int, num_planes: int) -> tuple[int, int]:
+    """(warps, C), mirroring output_pass_launch."""
+    two_ctas = PORTABLE_SMEM_PER_SM // 2 - RESERVED_SMEM_PER_CTA
+    for chunk in (64, 32):
+        if tc_smem_total(head_dim, num_planes, MAX_TABLES, chunk, 8, True) <= two_ctas:
+            return 8, chunk
+    fits_64 = tc_smem_total(head_dim, num_planes, MAX_TABLES, 64, 16, True) <= PORTABLE_SMEM_BYTES
+    return 16, 64 if fits_64 else 32
+
+
+def tile_sums_launch(head_dim: int, num_planes: int) -> tuple[int, int]:
+    """(warps, C), mirroring tile_sums_launch."""
+    state_tiles = round_up16(MAX_TABLES << num_planes) // FRAG * (head_dim // FRAG)
+    return (8 if state_tiles <= 4 * 8 else 16), output_pass_launch(head_dim, num_planes)[1]
+
+
+def all_tc_instantiations():
+    """(D, P, L, C, warps, emit_output) of every compiled v2b kernel."""
+    for head_dim, num_planes, num_tables in all_shapes():
+        warps, chunk = output_pass_launch(head_dim, num_planes)
+        yield head_dim, num_planes, num_tables, chunk, warps, True
+        warps, chunk = tile_sums_launch(head_dim, num_planes)
+        yield head_dim, num_planes, num_tables, chunk, warps, False
+
+
+def test_tc_launch_shapes():
+    for head_dim, num_planes in itertools.product(HEAD_DIMS, PLANE_COUNTS):
+        warps, chunk = output_pass_launch(head_dim, num_planes)
+        expected = (8, 32) if head_dim == 64 and num_planes <= 4 else (16, 32)
+        assert (warps, chunk) == expected
+        assert tile_sums_launch(head_dim, num_planes) == ((16, 32) if (head_dim, num_planes) == (128, 5) else (8, 32))
+    # Config A: two output-pass CTAs share a 100 KiB SM; config B needs A100 or H100.
+    assert tc_smem_total(64, 4, 4, 32, 8, True) == 49_920
+    assert 2 * (49_920 + RESERVED_SMEM_PER_CTA) <= PORTABLE_SMEM_PER_SM
+    assert tc_smem_total(128, 4, 4, 32, 16, True) == 92_928
+    assert OPTIN_LIMITS["sm_89"] < tc_smem_total(128, 5, 4, 32, 16, True) <= OPTIN_LIMITS["sm_80"]
+
+
+@pytest.mark.parametrize("head_dim, num_planes, num_tables, chunk, warps, emit",
+                         list(all_tc_instantiations()))
+def test_tc_smem_layout_is_aligned_disjoint_and_fits(head_dim, num_planes, num_tables, chunk, warps, emit):
+    layout = tc_smem_layout(head_dim, num_planes, num_tables, chunk, warps, emit)
+    total = layout.pop("total")[0]
+    regions = sorted(layout.values())
+    for (offset, length), (next_offset, _) in zip(regions[:-1], regions[1:], strict=True):
+        assert offset % 32 == 0 and offset + length <= next_offset  # wmma fragment pointers
+    assert total <= OPTIN_LIMITS["sm_80"]
+    # Only d = 128, P = 5 with L >= 3 is too large for sm_86 / sm_89.
+    too_big = emit and head_dim == 128 and num_planes == 5 and num_tables >= 3
+    assert (total > OPTIN_LIMITS["sm_89"]) == too_big
+    # The U tiles, fp32 [sides][C][LP16 + 4], fit in the scratch region.
+    u_bytes = (2 if emit else 1) * chunk * (round_up16(num_tables * num_planes) + 4) * 4
+    assert u_bytes <= layout["scratch"][1]
+
+
+@pytest.mark.parametrize("head_dim, num_planes, num_tables", list(all_shapes()))
+def test_tc_strides_are_wmma_legal_and_spread_over_banks(head_dim, num_planes, num_tables):
+    features_padded = round_up16(num_tables << num_planes)
+    chunk = output_pass_launch(head_dim, num_planes)[1]
+    for stride in (max(head_dim, features_padded) + 8, head_dim + 8, features_padded + 8, GRAM_TILE_STRIDE):
+        assert stride % 8 == 0  # ldm: a multiple of 16 bytes
+        words = stride // 2
+        assert words % 4 == 0 and (words // 4) % 2 == 1  # 8 rows hit 8 distinct 4-bank groups
+        assert len({(row * words) % 32 // 4 for row in range(8)}) == 8
+    assert SCRATCH_STRIDE % 4 == 0  # fp32 ldm: a multiple of 16 bytes
+
+
+@pytest.mark.parametrize("head_dim, num_planes, num_tables, chunk, warps, emit",
+                         list(all_tc_instantiations()))
+def test_tc_row_staging_covers_each_vector_once(head_dim, num_planes, num_tables, chunk, warps, emit):
+    threads = warps * WARP
+    vectors_per_row = head_dim // 8
+    vectors = chunk * vectors_per_row
+    iters = -(-vectors // threads)
+    seen = [(it * threads + tid) for it in range(iters) for tid in range(threads) if it * threads + tid < vectors]
+    assert sorted(seen) == list(range(vectors))
+    # A warp's vectors are consecutive: whole 128-byte row segments.
+    assert all(v // vectors_per_row == (v - v % vectors_per_row) // vectors_per_row for v in seen)
+
+
+@pytest.mark.parametrize("head_dim, num_planes, num_tables, chunk, warps, emit",
+                         list(all_tc_instantiations()))
+def test_tc_phi_pairs_cover_each_side_token_table_once(head_dim, num_planes, num_tables, chunk, warps, emit):
+    threads = warps * WARP
+    sides = 2 if emit else 1
+    per_side = chunk * num_tables
+    owners, by_warp = {}, {}
+    for tid in range(threads):
+        for pair in range(tid, sides * per_side, threads):
+            side, table, token = pair // per_side, (pair - (pair // per_side) * per_side) // chunk, pair % chunk
+            assert (side, table, token) not in owners
+            owners[(side, table, token)] = tid
+            by_warp.setdefault(pair // WARP, set()).add((side, table))
+    assert len(owners) == sides * per_side
+    assert all(len(pairs) == 1 for pairs in by_warp.values())  # one (side, table) per warp
+
+
+def gram_tile_coords(t: int) -> tuple[int, int]:
+    ti = 0
+    while (ti + 1) * (ti + 2) // 2 <= t:
+        ti += 1
+    return ti, t - ti * (ti + 1) // 2
+
+
+@pytest.mark.parametrize("chunk", [32, 64])
+def test_tc_gram_tiles_cover_the_lower_triangle_once(chunk):
+    row_tiles = chunk // FRAG
+    tiles = [gram_tile_coords(t) for t in range(row_tiles * (row_tiles + 1) // 2)]
+    assert sorted(tiles) == [(ti, tj) for ti in range(row_tiles) for tj in range(ti + 1)]
+
+
+def output_row_tile(warp: int, round_index: int, warps: int, col_tiles: int) -> int:
+    rows_per_round = warps // col_tiles
+    ti = (warp + round_index * warps) // col_tiles
+    first = round_index * rows_per_round
+    return 2 * first + rows_per_round - 1 - ti if round_index % 2 == 1 else ti
+
+
+@pytest.mark.parametrize("head_dim, chunk, warps", [(64, 32, 8), (64, 32, 16), (128, 32, 16), (64, 64, 8),
+                                                    (128, 64, 16), (64, 64, 16)])
+def test_tc_output_tiles_cover_each_tile_once_with_balanced_rounds(head_dim, chunk, warps):
+    row_tiles, col_tiles = chunk // FRAG, head_dim // FRAG
+    tiles = row_tiles * col_tiles
+    rounds = -(-tiles // warps)
+    assert rounds <= 2 and warps % col_tiles == 0 and (rounds == 1 or tiles % warps == 0)
+    owners = {}
+    intra_steps = {}
+    for warp in range(min(warps, tiles)):
+        for r in range(rounds):
+            tile = (output_row_tile(warp, r, warps, col_tiles), warp % col_tiles)
+            assert tile not in owners
+            owners[tile] = warp
+            intra_steps[warp] = intra_steps.get(warp, 0) + tile[0] + 1
+    assert set(owners) == {(ti, tc) for ti in range(row_tiles) for tc in range(col_tiles)}
+    if rounds == 2:  # every warp gets the same causal intra work
+        assert len(set(intra_steps.values())) == 1
+
+
+@pytest.mark.parametrize("head_dim, num_planes, num_tables, chunk, warps, emit",
+                         list(all_tc_instantiations()))
+def test_tc_state_tiles_and_mass_groups(head_dim, num_planes, num_tables, chunk, warps, emit):
+    features_padded = round_up16(num_tables << num_planes)
+    feature_tiles, col_tiles = features_padded // FRAG, head_dim // FRAG
+    state_tiles = feature_tiles * col_tiles
+    per_warp = -(-state_tiles // warps)
+    owners = {}
+    for warp in range(warps):
+        for f in range(per_warp):
+            idx = warp + f * warps
+            if idx < state_tiles:
+                fs, tc = idx // col_tiles, idx % col_tiles
+                assert tc == warp % col_tiles  # a warp's tiles share one V fragment per step
+                assert (fs, tc) not in owners
+                owners[(fs, tc)] = warp
+    assert len(owners) == state_tiles
+    # 128 registers per thread: at most 4 resident state tiles (32 registers).
+    assert per_warp <= 4
+    # A update: groups of G consecutive lanes inside one warp, every feature once.
+    threads = warps * WARP
+    group = min(1 << ((threads // features_padded).bit_length() - 1), WARP)
+    assert chunk % group == 0 and WARP % group == 0
+    features = {tid // group for tid in range(threads) if tid // group < features_padded}
+    assert features == set(range(features_padded))
+    assert THREADS_PER_SM % threads == 0

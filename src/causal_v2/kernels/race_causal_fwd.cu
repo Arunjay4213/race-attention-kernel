@@ -1,5 +1,7 @@
-// Chunk-parallel causal RACE Attention forward, v2a: three kernels plus host
-// launchers. Design and numbers: docs/causal_v2_design.md (sections 3-7).
+// Chunk-parallel causal RACE Attention forward, v2a: three kernels plus the
+// public host launchers, which also dispatch to the v2b kernels in
+// race_causal_fwd_tc.cu. Design and numbers: docs/causal_v2_design.md
+// (sections 3-7).
 //
 // Math, per stream (one batch-head) with Phi(x) in R^S the L tables' corner
 // probabilities, table-major (feature s = l * R + r):
@@ -59,6 +61,7 @@
 
 #include "../../noncausal/kernels/race_common.cuh"
 #include "../../noncausal/kernels/race_internal.cuh"
+#include "race_causal_internal.cuh"
 
 namespace race {
 namespace causal {
@@ -68,8 +71,6 @@ using detail::accumulate_stage;
 using detail::bf16;
 using detail::BuildOwnership;
 using detail::Dims;
-using detail::dispatch_planes;
-using detail::kDefaultDynamicSmemBytes;
 using detail::kMaxGridY;
 using detail::kMaxPlanes;
 using detail::kMaxTables;
@@ -86,10 +87,6 @@ constexpr int kMaxSeqLen = std::numeric_limits<int>::max() - kMaxAutoTileTokens 
 // tx = tid % 16) for the register micro-tiled products.
 constexpr int kGridSide = 16;
 static_assert(kGridSide * kGridSide == kThreads, "K3 assumes a 16 x 16 thread grid");
-
-// The smallest per-CTA opt-in shared memory among sm_80 (163 KiB), sm_89
-// (99 KiB) and sm_90 (227 KiB). Used only to choose C, not to launch.
-constexpr size_t kPortableSmemBytes = 99 * 1024;
 
 // K2 loads this many tiles ahead of the running sum so several independent
 // loads are in flight per thread (plan section 5, Little's law).
@@ -683,16 +680,6 @@ __global__ void __launch_bounds__(kThreads, 3)
 // Host side
 // ---------------------------------------------------------------------------
 
-// Calls fn(integral_constant<D>, integral_constant<P>) for the runtime shape.
-template <typename Fn>
-cudaError_t dispatch_shape(const CausalShape& shape, Fn&& fn) {
-    switch (shape.head_dim) {
-        case 64: return dispatch_planes<64>(shape.num_planes, fn);
-        case 128: return dispatch_planes<128>(shape.num_planes, fn);
-        default: return cudaErrorInvalidValue;
-    }
-}
-
 int64_t ceil_div64(int64_t a, int64_t b) { return (a + b - 1) / b; }
 
 int64_t pow2_floor(int64_t x) {
@@ -705,41 +692,37 @@ int64_t pow2_floor(int64_t x) {
 using OutputPassKernel = void (*)(const bf16*, const bf16*, const bf16*, const float*,
                                   const float*, const float*, bf16*, int, int, int, int);
 
-// The K3 kernel for (D, P) with its dynamic shared memory opted in. The
-// attribute is per device, so it is set on every call rather than cached.
+// The K3 kernel for (D, P) with its dynamic shared memory opted in (the
+// largest carveout is requested so 2 CTAs fit where the footprint allows).
 template <int D, int P>
 cudaError_t prepare_output_pass(int num_tables, OutputPassKernel* kernel, size_t* smem_bytes) {
     constexpr int C = choose_sub_chunk(D, P);
     *kernel = output_pass_kernel<D, P, C>;
     *smem_bytes = output_smem_layout(D, P, C, num_tables).total;
+    return opt_in_shared_memory(*kernel, *smem_bytes);
+}
 
-    int device = 0;
-    cudaError_t err = cudaGetDevice(&device);
-    if (err != cudaSuccess) return err;
-    int limit = 0;
-    err = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (err != cudaSuccess) return err;
-    if (*smem_bytes > static_cast<size_t>(limit)) return cudaErrorInvalidConfiguration;
-
-    if (*smem_bytes > kDefaultDynamicSmemBytes) {
-        err = cudaFuncSetAttribute(*kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   static_cast<int>(*smem_bytes));
+// Resident v2a output-pass CTAs per SM.
+cudaError_t output_pass_occupancy(const CausalShape& shape, int* ctas_per_sm) {
+    return dispatch_shape(shape, [&](auto dim, auto planes_count) {
+        constexpr int D = decltype(dim)::value;
+        constexpr int P = decltype(planes_count)::value;
+        OutputPassKernel kernel = nullptr;
+        size_t smem_bytes = 0;
+        const cudaError_t err = prepare_output_pass<D, P>(shape.num_tables, &kernel, &smem_bytes);
         if (err != cudaSuccess) return err;
-    }
-    // Ask for the largest shared-memory carveout so 2 CTAs fit where the
-    // footprint allows it (a hint; the driver may round).
-    return cudaFuncSetAttribute(*kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                cudaSharedmemCarveoutMaxShared);
+        return cudaOccupancyMaxActiveBlocksPerMultiprocessor(ctas_per_sm, kernel, kThreads, smem_bytes);
+    });
 }
 
 // Default tile length: the smallest power of two >= C for which the state
 // traffic 16 * S * (D + 1) / T_blk bytes per token is at most 5% of the
 // 12 * D bytes of Q/K/V/O traffic, capped at kMaxAutoTileTokens. This gives
 // 2048 for config A and 4096 for config B (plan section 3.3).
-int default_tile_tokens(const CausalShape& shape) {
+int default_tile_tokens(const CausalShape& shape, Variant variant) {
     const int64_t num_features = static_cast<int64_t>(shape.num_tables) << shape.num_planes;
     const int64_t state_bytes_x16 = 16 * num_features * (shape.head_dim + 1);
-    int tile = sub_chunk_tokens(shape.head_dim, shape.num_planes);
+    int tile = sub_chunk_tokens(shape.head_dim, shape.num_planes, variant);
     // 16 S (D + 1) / T <= 0.05 * 12 D   <=>   T * 3 * D >= 80 * S * (D + 1)
     while (tile < kMaxAutoTileTokens &&
            static_cast<int64_t>(tile) * 3 * shape.head_dim < 5 * state_bytes_x16) {
@@ -758,15 +741,22 @@ bool is_supported(const CausalShape& shape) {
            shape.batch_heads <= kMaxGridY;
 }
 
-int sub_chunk_tokens(int head_dim, int num_planes) { return choose_sub_chunk(head_dim, num_planes); }
+bool tensor_cores_precise_carry() { return RACE_CAUSAL_PRECISE_CARRY != 0; }
 
-size_t output_pass_smem_bytes(const CausalShape& shape) {
+int sub_chunk_tokens(int head_dim, int num_planes, Variant variant) {
+    return variant == Variant::kTensorCores ? tc::sub_chunk_tokens(head_dim, num_planes)
+                                            : choose_sub_chunk(head_dim, num_planes);
+}
+
+size_t output_pass_smem_bytes(const CausalShape& shape, Variant variant) {
     if (!is_supported(shape)) return 0;
+    if (variant == Variant::kTensorCores) return tc::output_pass_smem_bytes(shape);
     const int chunk = sub_chunk_tokens(shape.head_dim, shape.num_planes);
     return output_smem_layout(shape.head_dim, shape.num_planes, chunk, shape.num_tables).total;
 }
 
-cudaError_t race_causal_output_fits(const CausalShape& shape, bool* fits, int* limit_bytes) {
+cudaError_t race_causal_output_fits(const CausalShape& shape, bool* fits, int* limit_bytes,
+                                    Variant variant) {
     *fits = false;
     *limit_bytes = 0;
     int device = 0;
@@ -774,13 +764,13 @@ cudaError_t race_causal_output_fits(const CausalShape& shape, bool* fits, int* l
     if (err != cudaSuccess) return err;
     err = cudaDeviceGetAttribute(limit_bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     if (err != cudaSuccess) return err;
-    const size_t needed = output_pass_smem_bytes(shape);
+    const size_t needed = output_pass_smem_bytes(shape, variant);
     *fits = needed > 0 && needed <= static_cast<size_t>(*limit_bytes);
     return cudaSuccess;
 }
 
-bool is_valid_tile_tokens(const CausalShape& shape, int tile_tokens) {
-    const int chunk = sub_chunk_tokens(shape.head_dim, shape.num_planes);
+bool is_valid_tile_tokens(const CausalShape& shape, int tile_tokens, Variant variant) {
+    const int chunk = sub_chunk_tokens(shape.head_dim, shape.num_planes, variant);
     return is_supported(shape) && tile_tokens > 0 && tile_tokens % chunk == 0 &&
            tile_tokens <= std::numeric_limits<int>::max() - shape.seq_len;
 }
@@ -801,7 +791,8 @@ size_t final_state_floats(const CausalShape& shape) {
     return static_cast<size_t>(shape.batch_heads) * shape.num_tables * slice_floats(shape);
 }
 
-cudaError_t race_causal_select_tile_tokens(const CausalShape& shape, int* tile_tokens) {
+cudaError_t race_causal_select_tile_tokens(const CausalShape& shape, int* tile_tokens,
+                                           Variant variant) {
     if (!is_supported(shape)) return cudaErrorInvalidValue;
     int device = 0;
     cudaError_t err = cudaGetDevice(&device);
@@ -811,31 +802,26 @@ cudaError_t race_causal_select_tile_tokens(const CausalShape& shape, int* tile_t
     if (err != cudaSuccess) return err;
 
     int ctas_per_sm = 0;
-    err = dispatch_shape(shape, [&](auto dim, auto planes_count) {
-        constexpr int D = decltype(dim)::value;
-        constexpr int P = decltype(planes_count)::value;
-        OutputPassKernel kernel = nullptr;
-        size_t smem_bytes = 0;
-        const cudaError_t prep = prepare_output_pass<D, P>(shape.num_tables, &kernel, &smem_bytes);
-        if (prep != cudaSuccess) return prep;
-        return cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas_per_sm, kernel, kThreads,
-                                                             smem_bytes);
-    });
+    err = variant == Variant::kTensorCores ? tc::output_pass_occupancy(shape, &ctas_per_sm)
+                                           : output_pass_occupancy(shape, &ctas_per_sm);
     if (err != cudaSuccess) return err;
 
     // Enough tiles for about 4 waves of output-pass CTAs, in powers of two.
-    const int chunk = sub_chunk_tokens(shape.head_dim, shape.num_planes);
+    const int chunk = sub_chunk_tokens(shape.head_dim, shape.num_planes, variant);
     const int64_t tokens = static_cast<int64_t>(shape.batch_heads) * shape.seq_len;
     const int64_t target = tokens / (4 * static_cast<int64_t>(num_sms) * std::max(ctas_per_sm, 1));
     const int64_t shrunk = std::max<int64_t>(pow2_floor(std::max<int64_t>(target, 1)), chunk);
-    *tile_tokens = static_cast<int>(std::min<int64_t>(shrunk, default_tile_tokens(shape)));
+    *tile_tokens = static_cast<int>(std::min<int64_t>(shrunk, default_tile_tokens(shape, variant)));
     return cudaSuccess;
 }
 
 cudaError_t race_causal_tile_sums(const bf16* k, const bf16* v, const float* planes,
                                   const float* beta, float* workspace, const CausalShape& shape,
-                                  int tile_tokens, cudaStream_t stream) {
-    if (!is_valid_tile_tokens(shape, tile_tokens)) return cudaErrorInvalidValue;
+                                  int tile_tokens, cudaStream_t stream, Variant variant) {
+    if (!is_valid_tile_tokens(shape, tile_tokens, variant)) return cudaErrorInvalidValue;
+    if (variant == Variant::kTensorCores) {
+        return tc::tile_sums(k, v, planes, beta, workspace, shape, tile_tokens, stream);
+    }
     const dim3 grid(num_tiles(shape, tile_tokens) * shape.num_tables, shape.batch_heads);
     return dispatch_shape(shape, [&](auto dim, auto planes_count) {
         constexpr int D = decltype(dim)::value;
@@ -849,7 +835,12 @@ cudaError_t race_causal_tile_sums(const bf16* k, const bf16* v, const float* pla
 
 cudaError_t race_causal_tile_scan(float* workspace, float* final_state, const CausalShape& shape,
                                   int tile_tokens, cudaStream_t stream) {
-    if (!is_valid_tile_tokens(shape, tile_tokens)) return cudaErrorInvalidValue;
+    // The scan does not depend on C, so it takes any positive tile length;
+    // K1 and K3 enforce the multiple of their variant's C.
+    if (!is_supported(shape) || tile_tokens <= 0 ||
+        tile_tokens > std::numeric_limits<int>::max() - shape.seq_len) {
+        return cudaErrorInvalidValue;
+    }
     const int64_t tile_floats = static_cast<int64_t>(final_state_floats(shape));
     const int64_t blocks = ceil_div64(tile_floats, kThreads);
     tile_scan_kernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
@@ -859,8 +850,12 @@ cudaError_t race_causal_tile_scan(float* workspace, float* final_state, const Ca
 
 cudaError_t race_causal_output(const bf16* q, const bf16* k, const bf16* v, const float* planes,
                                const float* beta, const float* workspace, bf16* out,
-                               const CausalShape& shape, int tile_tokens, cudaStream_t stream) {
-    if (!is_valid_tile_tokens(shape, tile_tokens)) return cudaErrorInvalidValue;
+                               const CausalShape& shape, int tile_tokens, cudaStream_t stream,
+                               Variant variant) {
+    if (!is_valid_tile_tokens(shape, tile_tokens, variant)) return cudaErrorInvalidValue;
+    if (variant == Variant::kTensorCores) {
+        return tc::output(q, k, v, planes, beta, workspace, out, shape, tile_tokens, stream);
+    }
     const dim3 grid(num_tiles(shape, tile_tokens), shape.batch_heads);
     return dispatch_shape(shape, [&](auto dim, auto planes_count) {
         constexpr int D = decltype(dim)::value;
@@ -878,12 +873,15 @@ cudaError_t race_causal_output(const bf16* q, const bf16* k, const bf16* v, cons
 
 cudaError_t race_causal_forward(const bf16* q, const bf16* k, const bf16* v, const float* planes,
                                 const float* beta, float* workspace, float* final_state, bf16* out,
-                                const CausalShape& shape, int tile_tokens, cudaStream_t stream) {
-    cudaError_t err = race_causal_tile_sums(k, v, planes, beta, workspace, shape, tile_tokens, stream);
+                                const CausalShape& shape, int tile_tokens, cudaStream_t stream,
+                                Variant variant) {
+    cudaError_t err =
+        race_causal_tile_sums(k, v, planes, beta, workspace, shape, tile_tokens, stream, variant);
     if (err != cudaSuccess) return err;
     err = race_causal_tile_scan(workspace, final_state, shape, tile_tokens, stream);
     if (err != cudaSuccess) return err;
-    return race_causal_output(q, k, v, planes, beta, workspace, out, shape, tile_tokens, stream);
+    return race_causal_output(q, k, v, planes, beta, workspace, out, shape, tile_tokens, stream,
+                              variant);
 }
 
 }  // namespace causal

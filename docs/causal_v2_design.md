@@ -927,8 +927,8 @@ The β-gap tables, the v2a / v2b bf16 simulation, the error attribution and the 
 
 ## What the implementation changed
 
-`src/causal_v2/` implements the v2a build.
-It follows this design with these differences, each for a concrete reason (from the header of `src/causal_v2/kernels/race_causal_fwd.cu` and from `src/causal_v2/README.md`):
+`src/causal_v2/` implements both builds.
+v2a follows this design with these differences, each for a concrete reason (from the header of `src/causal_v2/kernels/race_causal_fwd.cu` and from `src/causal_v2/README.md`):
 
 - **Den is computed in the G step** instead of a separate step (section 6.2).
   The 16 threads that hold one row of G add their G entries and a strided share of Φ_Q · A, then a 16-lane shuffle reduction finishes the row.
@@ -955,5 +955,27 @@ It follows this design with these differences, each for a concrete reason (from 
   They take the planes as W [L, P, d] and compute φ with the direct length-R softmax, so a kernel test against them still checks the Bernoulli factorization.
 - **The GPU tolerance adds tiny absolute allowances** to the section 2.4 bounds (max ≤ 1.1·F, RMS ≤ 1.05·F_rms); they only matter when F is 0, for example at T = 1 or with a constant V.
   The derivation is in `src/causal_v2/tests/causal_numerics.py`.
-- **Only v2a is built.**
-  v2b (section 6.3) is not started, and the backward (section 11) is not implemented, so the causal binding is forward only.
+- **The backward (section 11) is not implemented**, so the causal binding is forward only.
+
+v2b (`src/causal_v2/kernels/race_causal_fwd_tc.cu`, selected with `tensor_cores=True`) follows section 6.3 with these differences; the numbers are A10G measurements (d = 64, P = 4, L = 4, T = 2¹⁸, 8 streams unless stated):
+
+- **G is split into bf16 hi + lo** instead of being rounded to bf16 (section 6.3 accepted the rounding).
+  With the rounding alone the first rows of a sequence, whose queries see few keys, exceeded the 2.5·F bound: 2.74·F at d = 64, P = 4, L = 4, T = 2047, β = 1/8, and 2.03·F_rms at d = 128, P = 1, L = 1, T = 64.
+  An fp64 emulation of the kernel's rounding points reproduces both numbers exactly, and gives 1.00·F and 1.34·F_rms without G's rounding.
+  V is exact in bf16, so the split costs one more MMA per intra step (not the three of section 7.4's operand splits), and Den sums G_hi + G_lo, which is exact in fp32.
+  It made the output pass about 9% slower.
+- **C = 32 for every shape, with a launch shape per kernel** instead of C = 64 and 8 warps.
+  The output pass runs 2 CTAs of 8 warps per SM where that footprint fits half of the smallest target's 100 KiB SM (d = 64 with P ≤ 4: 48.8 KiB at L = 4), else 1 CTA of 16 warps; the tile sums run 8 warps (16 for d = 128, P = 5, where 8 warps would hold 8 state tiles each and spill).
+  With 1 CTA of 8 warps the output pass issued about 0.2 instructions per cycle per scheduler: its barrier-separated phases (CUDA-core work for Φ, tensor-core work for Num) could not overlap.
+  2 CTAs of 8 warps at C = 32 took 3.06 ms against 3.61 ms for 1 CTA of 16 warps at C = 64 (before the G split).
+  On A100 and H100, C = 64 with 2 CTAs per SM would fit and has not been measured.
+- **L is a template parameter of the v2b kernels** (80 instantiations per architecture); with L at run time, integer address arithmetic was about 40% of the Num phase's instructions.
+- **The v2b K1 is its own kernel** built from the same device functions as the output pass, rather than the output pass with EMIT_OUTPUT = false; it keeps the workspace layout of v2a (section 4 option), reached 90% of the A10G's DRAM peak, and sums A from exactly the bf16 Φ_K that multiplies V.
+- **W is split in each CTA's prologue** rather than once on the host: it is at most 2560 floats read from L2, and the kernels keep a single fp32 W input.
+- **The bf16 carry copies of B are stored transposed** ([d][S16 + 8]), so the carry reads them as a column-major matrix_b without movmatrix transposes; the fp32 master stays in accumulator fragments as planned.
+- **Den is formed in the Num phase** by the two lanes of each row (Φ_Q·A plus the row sum of G_hi + G_lo) instead of a separate Den phase with row-partial buffers.
+- **The Φ step runs after a barrier on U tiles held in the scratch region**, one thread per (side, token, table), instead of each projecting warp computing Φ from its own scratch; the corners use a product tree that is bitwise equal to v2a's order.
+- **The next sub-chunk's Q, K, V are prefetched into registers** during the current one (section 6.3's v2b-2 planned cp.async double buffering); where a warp holds more than 2 state tiles (d = 128, P = 5, L ≥ 3) the prefetch is off because it would spill at 128 registers.
+- **Output rows are stored with `__stcs`** (one 16-byte streaming store per lane): a uint4 store built from four packed words compiled to four 32-bit stores for the global pointer, and the partial sectors cost 4× the DRAM writes (1.12 GB for a 268 MB output).
+- **PRECISE_CARRY is on for every shape**, as a compile-time switch (`RACE_CAUSAL_PRECISE_CARRY`); config B's cost on A100 and H100 has not been measured.
+- **wmma limits:** fragment loads from shared memory compile to generic 32-bit loads (not ldmatrix), and every scratch round trip is a store_matrix_sync and a reload; raw mma.sync with ldmatrix (section 6.3's v2b-3) would remove both.
