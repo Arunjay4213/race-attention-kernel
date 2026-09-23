@@ -131,9 +131,9 @@ The design is in `docs/noncausal_design.md`.
 
 ## Status
 
-Everything under `src/` has run on four GPUs: an A10G, an L4, and an A100-SXM4-40GB, the same model as the Phase 1 baseline.
+Everything under `src/` has run on four GPUs: an A10G, an L4, an L40S, and an A100-SXM4-40GB, the same model as the Phase 1 baseline.
 All test suites pass on each (2170 non-causal, 1717 causal on the A100), compute-sanitizer reports nothing, and every kernel compiles for sm_80, sm_86, sm_89 and sm_90 with no register spills.
-The reports are [`benchmarks/a10g_first_run.md`](benchmarks/a10g_first_run.md), [`benchmarks/a100_first_run.md`](benchmarks/a100_first_run.md) and [`benchmarks/a100_tensor_cores.md`](benchmarks/a100_tensor_cores.md).
+The reports are [`benchmarks/a10g_first_run.md`](benchmarks/a10g_first_run.md), [`benchmarks/a100_first_run.md`](benchmarks/a100_first_run.md), [`benchmarks/a100_tensor_cores.md`](benchmarks/a100_tensor_cores.md) and [`benchmarks/l40s_run.md`](benchmarks/l40s_run.md).
 
 The headline against the baseline table above, on the A100-40GB where the reference runs out of memory at T = 131072:
 
@@ -148,6 +148,7 @@ So the 2M-token forward runs in 8 GiB, 16× past the reference's wall, at 160× 
 
 Bandwidth: the non-causal tensor-core forward reaches 80% of the A100's HBM peak at P = 2, L = 2 and 52% at P = 4, L = 4, up from 38% and 9% on fp32 cores.
 The causal tensor-core kernel reaches 38% of peak counting the bytes it actually moves, up from 9%.
+On an L40S, which has 56% of the A100's bandwidth for a similar compute rate, the same kernels run at 77-84% of peak at every configuration and the 2M-token causal forward takes 18.6 ms, so the A100 gap is the kernel's remaining CUDA-core phases and barriers rather than memory.
 The three heavy stages (hash projection, bucket accumulation, query mixing) run on wmma bf16 fragments with fp32 accumulation, with the hash planes and the bucket state split into bf16 hi + lo pairs so the projection and the carry keep fp32-level accuracy; the tolerance derivations are in the tests.
 The fp32-core paths remain the defaults until a training run shows the bf16 rounding of the hash weights is harmless.
 
