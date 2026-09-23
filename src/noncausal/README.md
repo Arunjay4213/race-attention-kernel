@@ -2,9 +2,10 @@
 
 RACE Attention (arXiv 2510.04008, Algorithm 1, global normalization) as bf16 CUDA kernels: a three-kernel forward and a five-launch backward, with an fp64-capable PyTorch reference, an autograd wrapper, and tests.
 
-Status: the kernels compile cleanly with nvcc 12.8 and 13 for sm_80, sm_89 and sm_90 (no warnings, no spills, at most 64 registers per thread), and the torch extension builds, but they have **never run on a GPU**.
-The references, the backward derivation check, the CPU emulations of the kernels' data flow, and the index-coverage tests all pass on CPU.
-`tests/test_forward_cuda.py`, then `tests/test_backward_cuda.py`, are the first things to run on a GPU.
+Status: validated on an NVIDIA A10G (sm_86, 99 KB opt-in shared memory) with torch 2.10 and CUDA 12.8.
+All 1268 tests in `tests/` pass there (CPU and GPU, forward and backward), and compute-sanitizer memcheck, racecheck and synccheck report no errors on `infra/sanitize_cases.py`.
+The kernels compile with nvcc 12.8 for sm_80, sm_86, sm_89 and sm_90 with no spills and at most 64 registers per thread.
+Measurements and the one bug found on the GPU are in `benchmarks/a10g_first_run.md`.
 
 ## Math
 
