@@ -153,3 +153,9 @@ The kernels in `src/noncausal/kernels/` follow this design with these difference
   Like the forward, it uses no atomics and is bitwise reproducible.
 - The backward computes the sigmoids and 1/Den with a hardware reciprocal approximation plus one Newton step.
 - The per-token kernels use `__launch_bounds__(256, 4)`, which caps them at 64 registers per thread, and every kernel compiles with no spills.
+- The tensor-core forward (`kernels/race_fwd_tc.cu`, `tensor_cores=True`) replaces the bucket build and the query pass and keeps the tree reduce and the workspace layout.
+  One CTA hashes all L tables of a stage of 32 tokens, so the projection is one [32 × d] × [d × L·P] product and K, Q and V are read from HBM once; the build grid is (tiles, B·H) instead of (tiles·L, B·H).
+  W enters the projection as bf16 hi + lo (two MMAs), Φ is rounded to bf16 for the build and query fragments, and the reduced B enters the query as hi + lo.
+  A and Den are summed on CUDA cores from the same rounded Φ, so the rounding perturbs convex weights instead of scaling O; `tests/numerics.py` derives the resulting bound.
+  On the A10G it runs P = 4, L = 4 at 76% of HBM peak (N = 2²⁰, 4.4× the fp32-core path), and ncu shows both of its kernels memory-bound (82% to 86% DRAM throughput), as section 1 predicts.
+  The fp32-core path stays the default and the backward is unchanged.

@@ -6,11 +6,18 @@ a tile or sub-chunk, the half-idle (d=64, P=1) instantiation, the largest
 shared-memory configuration, and the multi-level reduce.
 The non-causal extension runs forward_train and then backward (with v as the
 output gradient) so the backward's per-warp scratch and __syncwarp ordering is
-checked too. Each call is checked for finiteness only; correctness is the
-test suites' job.
+checked too, and then the same with the tensor-core forward
+(tensor_cores=True), whose kernels stage every tile through shared memory
+with cp.async and several barriers per stage. Each call is checked for
+finiteness only; correctness is the test suites' job.
+
+Usage: python infra/sanitize_cases.py [noncausal] [causal_v2]
+With no arguments both extensions run; naming one runs only that one (and
+builds only that one).
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import sys
 from pathlib import Path
@@ -49,25 +56,36 @@ CASES = [
 
 
 def main() -> None:
-    noncausal = load("noncausal")
-    causal = load("causal_v2")
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("extensions", nargs="*", choices=["noncausal", "causal_v2"])
+    selected = parser.parse_args().extensions or ["noncausal", "causal_v2"]
+    noncausal = load("noncausal") if "noncausal" in selected else None
+    causal = load("causal_v2") if "causal_v2" in selected else None
     beta = torch.tensor(1.0, device="cuda")
     for bh, n, d, p, l in CASES:
         q, k, v, w = inputs(bh, n, d, p, l, seed=n)
-        out, bucket_totals = noncausal.forward_train(q, k, v, w, beta)
+        if noncausal is not None:
+            check_noncausal(noncausal, q, k, v, w, beta, (bh, n, d, p, l))
+        if causal is not None:
+            try:
+                out = causal.forward(q, k, v, w, beta, 0)
+            except RuntimeError as err:  # configuration refused on this GPU (shared memory)
+                print(f"causal skipped {(bh, n, d, p, l)}: {str(err).splitlines()[0]}")
+                continue
+            torch.cuda.synchronize()
+            assert torch.isfinite(out).all(), f"causal non-finite at {(bh, n, d, p, l)}"
+        print(f"ok {(bh, n, d, p, l)}")
+
+
+def check_noncausal(noncausal, q, k, v, w, beta, case) -> None:
+    for tensor_cores in (False, True):
+        label = "noncausal tc" if tensor_cores else "noncausal"
+        out, bucket_totals = noncausal.forward_train(q, k, v, w, beta, tensor_cores=tensor_cores)
         torch.cuda.synchronize()
-        assert torch.isfinite(out).all(), f"noncausal non-finite at {(bh, n, d, p, l)}"
+        assert torch.isfinite(out).all(), f"{label} non-finite at {case}"
         grads = noncausal.backward(v, q, k, v, w, beta, bucket_totals)
         torch.cuda.synchronize()
-        assert all(torch.isfinite(g).all() for g in grads), f"noncausal backward non-finite at {(bh, n, d, p, l)}"
-        try:
-            out = causal.forward(q, k, v, w, beta, 0)
-        except RuntimeError as err:  # configuration refused on this GPU (shared memory)
-            print(f"causal skipped {(bh, n, d, p, l)}: {str(err).splitlines()[0]}")
-            continue
-        torch.cuda.synchronize()
-        assert torch.isfinite(out).all(), f"causal non-finite at {(bh, n, d, p, l)}"
-        print(f"ok {(bh, n, d, p, l)}")
+        assert all(torch.isfinite(g).all() for g in grads), f"{label} backward non-finite at {case}"
 
 
 if __name__ == "__main__":

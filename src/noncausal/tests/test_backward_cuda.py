@@ -19,6 +19,7 @@ from numerics import (
     make_bf16_grad_output,
     make_bf16_inputs,
     reference_backward,
+    tc_totals_backward_perturbation,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
@@ -98,6 +99,52 @@ def test_backward_runs_are_bitwise_identical(race, seq_len):
         again = kernel_backward(race, grad_o, q, k, v, W, beta)
         for a, b in zip(first, again, strict=True):
             assert torch.equal(a, b)
+
+
+def check_backward_on_tc_totals(race, batch, heads, seq_len, head_dim, num_planes, num_tables,
+                                beta):
+    # The trailing 1 keeps these inputs distinct from run_and_check's.
+    seed = case_seed(batch, heads, seq_len, head_dim, num_planes, num_tables, beta, 1)
+    q, k, v, W = make_bf16_inputs(
+        seed, batch, heads, seq_len, head_dim, num_tables, num_planes, device="cuda"
+    )
+    grad_o = make_bf16_grad_output(seed + 1, q)
+    beta_tensor = torch.tensor(beta, device="cuda")
+    out, bucket_totals = race.forward_train(q, k, v, W, beta_tensor, tensor_cores=True)
+    assert torch.equal(out, race.forward(q, k, v, W, beta_tensor, tensor_cores=True))
+    grads = race.backward(grad_o, q, k, v, W, beta_tensor, bucket_totals)
+    names = ("dq", "dk", "dv")
+
+    # The backward reads the tensor-core totals like any others: against the
+    # VJP evaluated at those totals, the plain backward tolerance holds.
+    ref, scales = reference_backward(grad_o, q, k, v, W, beta, bucket_totals=bucket_totals)
+    for name, grad, expected, scale in zip(names, grads[:3], ref[:3], scales[:3], strict=True):
+        assert_grad_close(grad, expected, scale, beta, name)
+    assert_beta_grad_close(grads[3], ref[3], scales[3], beta)
+
+    # Round trip against the exact VJP: the backward tolerance plus the bound
+    # on how far the forward's bf16 rounding in the totals moves the VJP.
+    ref, scales = reference_backward(grad_o, q, k, v, W, beta)
+    shifts = tc_totals_backward_perturbation(grad_o, q, k, v, W, beta)
+    for name, grad, expected, scale, shift in zip(names, grads[:3], ref[:3], scales[:3],
+                                                  shifts[:3], strict=True):
+        assert_grad_close(grad, expected, scale, beta, name, shift)
+    assert_beta_grad_close(grads[3], ref[3], scales[3], beta, shifts[3])
+
+
+@pytest.mark.parametrize("seq_len", SEQ_LENS)
+@pytest.mark.parametrize("num_tables", TABLE_COUNTS)
+@pytest.mark.parametrize("num_planes", PLANE_COUNTS)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_backward_on_tc_forward_totals(race, head_dim, num_planes, num_tables, seq_len):
+    check_backward_on_tc_totals(race, 1, 2, seq_len, head_dim, num_planes, num_tables, BETA)
+
+
+@pytest.mark.parametrize("beta", [None, 4.0])  # None: 1 / sqrt(d)
+@pytest.mark.parametrize("head_dim, num_planes, num_tables", [(64, 3, 3), (128, 5, 4), (128, 4, 4)])
+def test_backward_on_tc_forward_totals_betas(race, head_dim, num_planes, num_tables, beta):
+    beta = head_dim**-0.5 if beta is None else beta
+    check_backward_on_tc_totals(race, 1, 3, 3001, head_dim, num_planes, num_tables, beta)
 
 
 def test_every_template_instantiation_backward(race):

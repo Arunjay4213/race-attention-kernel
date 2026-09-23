@@ -22,9 +22,15 @@ import pathlib
 from types import ModuleType
 
 KERNEL_DIR = pathlib.Path(__file__).resolve().parent / "kernels"
-SOURCES = [KERNEL_DIR / "torch_binding.cpp", KERNEL_DIR / "race_fwd.cu", KERNEL_DIR / "race_bwd.cu"]
+SOURCES = [
+    KERNEL_DIR / "torch_binding.cpp",
+    KERNEL_DIR / "race_fwd.cu",
+    KERNEL_DIR / "race_fwd_tc.cu",
+    KERNEL_DIR / "race_bwd.cu",
+]
 HEADERS = [
     KERNEL_DIR / "race_fwd.h",
+    KERNEL_DIR / "race_fwd_tc.h",
     KERNEL_DIR / "race_bwd.h",
     KERNEL_DIR / "race_common.cuh",
     KERNEL_DIR / "race_internal.cuh",

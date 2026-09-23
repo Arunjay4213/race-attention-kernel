@@ -7,7 +7,10 @@ The workspace round trip (O(N / 2048 * R * d) floats) and repeated K/V
 reads served from L2 are excluded, so the % of peak is a lower bound on how
 close the kernels are to the memory floor.
 
-Usage: python bench/bench_forward.py [--bh 4] [--min-log2 14] [--max-log2 20]
+--variant selects the fp32-core kernels (fp32), the tensor-core bucket build
+and query pass (tc), or both, timed back to back on the same inputs.
+
+Usage: python bench/bench_forward.py [--variant both] [--bh 4] [--min-log2 14] [--max-log2 20]
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ WARMUP_RUNS = 5
 TIMED_RUNS = 20
 HEAD_DIM = 128
 CONFIGS = [(2, 2), (4, 4)]  # (P, L)
+VARIANTS = {"fp32": False, "tc": True}  # name -> tensor_cores flag
 
 # Peak HBM bandwidth in GB/s by device-name substring, first match wins
 # (more specific names first, e.g. "L40S" before "L4").
@@ -72,14 +76,19 @@ def main() -> None:
     parser.add_argument("--bh", type=int, default=4, help="batch * heads")
     parser.add_argument("--min-log2", type=int, default=14)
     parser.add_argument("--max-log2", type=int, default=20)
+    parser.add_argument("--variant", choices=[*VARIANTS, "both"], default="both")
     args = parser.parse_args()
+    variants = list(VARIANTS) if args.variant == "both" else [args.variant]
 
     race = load_extension(verbose=False)
     device_name = torch.cuda.get_device_name()
     peak = peak_bandwidth_gbps(device_name)
     print(f"device: {device_name}, peak HBM: {f'{peak:.0f} GB/s' if peak else 'unknown'}")
     print(f"d={HEAD_DIM}, B*H={args.bh}, median of {TIMED_RUNS} runs after {WARMUP_RUNS} warmups")
-    header = f"{'P':>2} {'L':>2} {'N':>9} {'ms':>9} {'MB moved':>10} {'GB/s':>8} {'% peak':>7}"
+    header = (
+        f"{'variant':>7} {'P':>2} {'L':>2} {'N':>9} {'ms':>9} {'MB moved':>10} {'GB/s':>8} "
+        f"{'% peak':>7}"
+    )
     print(header)
     print("-" * len(header))
 
@@ -94,14 +103,15 @@ def main() -> None:
                 torch.randn(shape, device="cuda", generator=gen, dtype=torch.bfloat16)
                 for _ in range(3)
             )
-            ms = median_ms(race.forward, q, k, v, W, beta)
             bytes_moved = 4 * args.bh * seq_len * HEAD_DIM * 2
-            gbps = bytes_moved / (ms * 1e-3) / 1e9
-            percent = f"{100 * gbps / peak:6.1f}%" if peak else "    n/a"
-            print(
-                f"{num_planes:>2} {num_tables:>2} {seq_len:>9} {ms:>9.3f} "
-                f"{bytes_moved / 1e6:>10.1f} {gbps:>8.1f} {percent:>7}"
-            )
+            for variant in variants:
+                ms = median_ms(race.forward, q, k, v, W, beta, VARIANTS[variant])
+                gbps = bytes_moved / (ms * 1e-3) / 1e9
+                percent = f"{100 * gbps / peak:6.1f}%" if peak else "    n/a"
+                print(
+                    f"{variant:>7} {num_planes:>2} {num_tables:>2} {seq_len:>9} {ms:>9.3f} "
+                    f"{bytes_moved / 1e6:>10.1f} {gbps:>8.1f} {percent:>7}"
+                )
             del q, k, v
         print()
 

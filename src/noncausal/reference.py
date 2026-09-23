@@ -231,6 +231,7 @@ def hash_backward(
 def race_backward_reference(
     grad_o: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     W: torch.Tensor, beta: torch.Tensor, return_scales: bool = False,
+    bucket_totals: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Vector-Jacobian product of race_forward_reference, decomposed like the kernels.
 
@@ -251,6 +252,10 @@ def race_backward_reference(
     Args:
         grad_o: [B, H, N_q, d]. q: [B, H, N_q, d]. k, v: [B, H, N, d].
         W: [L, P, d]. beta: 0-dim tensor.
+        bucket_totals: optional (A [B, H, L, R], B [B, H, L, R, d]) used in
+            place of the bucket sums of k and v, the way the backward kernels
+            use whatever totals the forward saved. Without it the result is
+            the exact VJP.
 
     Returns:
         dq, dk, dv with the shapes of q, k, v, and dbeta as a 0-dim tensor.
@@ -262,8 +267,11 @@ def race_backward_reference(
     """
     phi_q, u_q, plus_q, minus_q = soft_hash(q, W, beta)
     phi_k, u_k, plus_k, minus_k = soft_hash(k, W, beta)
-    mass = phi_k.sum(dim=2)  # A: [B, H, L, R]
-    weighted_values = torch.einsum("bhnlr,bhnd->bhlrd", phi_k, v)  # B: [B, H, L, R, d]
+    if bucket_totals is None:
+        mass = phi_k.sum(dim=2)  # A: [B, H, L, R]
+        weighted_values = torch.einsum("bhnlr,bhnd->bhlrd", phi_k, v)  # B: [B, H, L, R, d]
+    else:
+        mass, weighted_values = bucket_totals
 
     y = torch.einsum("bhlrd,bhnd->bhnlr", weighted_values, grad_o)
     den = torch.einsum("bhnlr,bhlr->bhn", phi_q, mass)

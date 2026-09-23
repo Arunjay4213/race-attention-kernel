@@ -8,10 +8,13 @@ of kernels/race_fwd.cu that can be checked without one:
   - the query kernel's shared-memory regions are aligned, disjoint and fit
     the smallest opt-in limit of the supported GPUs,
   - the full pipeline in fp32 through the real workspace layout matches the
-    fp64 reference well inside the tolerance the CUDA tests use.
+    fp64 reference well inside the tolerance the CUDA tests use,
+  - the same for the tensor-core path (race_fwd_tc.cu): its data flow with
+    bf16 phi, hi + lo planes and buckets, and fp32 accumulation stays within
+    the derived tensor-core bound, and its fp32 part within the fp32 atol.
 
-The constants and formulas below mirror race_fwd.cu and race_fwd.h and must be
-kept in sync with them.
+The constants and formulas below mirror race_fwd.cu, race_fwd_tc.cu and
+race_fwd.h and must be kept in sync with them.
 """
 from __future__ import annotations
 
@@ -21,9 +24,12 @@ import torch
 from numerics import (
     BF16_UNIT_ROUNDOFF,
     assert_buckets_close,
+    assert_buckets_close_tc,
     assert_output_close,
+    assert_output_close_tc,
     make_bf16_inputs,
     output_atol,
+    tc_statistics,
 )
 from reference import bucket_sums, race_forward_reference
 
@@ -309,3 +315,184 @@ def test_emulated_pipeline_matches_reference(head_dim, num_planes, num_tables, s
     # The rtol term is not loose: bf16 rounding alone uses a large part of it.
     rounding_share = ((out.double() - out32.double()).abs() / (BF16_UNIT_ROUNDOFF * ref.abs())).max()
     assert rounding_share > 0.5
+
+
+# ---------------------------------------------------------------------------
+# Tensor-core path (race_fwd_tc.cu)
+# ---------------------------------------------------------------------------
+
+TC_STAGE_TOKENS = 32
+TC_FRAG = 16
+
+
+def tc_projection_parts(head_dim: int, num_planes: int, num_tables: int) -> int:
+    """kProjParts of TcDims: the k-split of the projection over the 8 warps."""
+    proj_col_tiles = -(-(num_planes * num_tables) // TC_FRAG)
+    return WARPS // ((TC_STAGE_TOKENS // TC_FRAG) * proj_col_tiles)
+
+
+def to_bf16(x: torch.Tensor) -> torch.Tensor:
+    return x.to(torch.bfloat16).float()
+
+
+def split_bf16(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """hi = bf16(x), lo = bf16(x - hi), as fp32 (split_rows_to_bf16)."""
+    hi = to_bf16(x)
+    return hi, to_bf16(x - hi)
+
+
+def corner_probs_tc(x: torch.Tensor, W: torch.Tensor, beta: float) -> torch.Tensor:
+    """bf16-rounded corner probabilities of the tensor-core kernels, as fp32. x [BH, N, D] -> [BH, N, L*R].
+
+    z = X (W_hi + W_lo)^T accumulated in fp32 one 16-wide k-step at a time,
+    hi before lo, within each of kProjParts contiguous k-ranges; the hash step
+    adds the parts in part order.
+    """
+    num_tables, num_planes, head_dim = W.shape
+    hi, lo = split_bf16(W.reshape(num_tables * num_planes, head_dim))
+    parts = tc_projection_parts(head_dim, num_planes, num_tables)
+    steps_per_part = head_dim // TC_FRAG // parts
+    z = torch.zeros(*x.shape[:-1], num_tables * num_planes)
+    for part in range(parts):
+        partial = torch.zeros_like(z)
+        for step in range(part * steps_per_part, (part + 1) * steps_per_part):
+            block = slice(step * TC_FRAG, (step + 1) * TC_FRAG)
+            partial = partial + x[..., block] @ hi[:, block].T
+            partial = partial + x[..., block] @ lo[:, block].T
+        z = z + partial
+    prob_plus, prob_minus = sigmoid_pair_fp32(2.0 * beta * torch.tanh(z))
+    prob_plus = prob_plus.reshape(*z.shape[:-1], num_tables, num_planes)
+    prob_minus = prob_minus.reshape(*z.shape[:-1], num_tables, num_planes)
+    corners = torch.arange(1 << num_planes)
+    phi = torch.ones(*z.shape[:-1], num_tables, 1 << num_planes)
+    for t in range(num_planes):
+        plus = ((corners >> (num_planes - 1 - t)) & 1).bool()
+        phi = phi * torch.where(plus, prob_plus[..., t : t + 1], prob_minus[..., t : t + 1])
+    return to_bf16(phi.reshape(*z.shape[:-1], -1))
+
+
+def emulate_forward_tc(q, k, v, W, beta: float, build_tile: int):
+    """fp32 forward with the tensor-core kernels' roundings and summation orders.
+
+    Returns:
+        out: [B, H, N, D] bf16. out32: fp32 before the final rounding.
+        mass [B, H, L, R], weighted [B, H, L, R, D]: the reduced A and B.
+        phi_q [BH, N, L*R], phi_k [BH, N, L*R]: the rounded probabilities (fp32).
+    """
+    batch, heads, seq_len, head_dim = q.shape
+    num_tables, num_planes, _ = W.shape
+    corners = 1 << num_planes
+    stacked = num_tables * corners
+    slots = max(16, 1 << (stacked - 1).bit_length())  # kCornerSlots
+    rows_per_pass = THREADS // slots
+    batch_heads = batch * heads
+    num_tiles = (seq_len + build_tile - 1) // build_tile
+    padded = num_tiles * build_tile
+
+    keys = k.float().reshape(batch_heads, seq_len, head_dim)
+    values = v.float().reshape(batch_heads, seq_len, head_dim)
+    phi_k = corner_probs_tc(keys, W, beta)
+    phi_k_tiles = torch.nn.functional.pad(phi_k, (0, 0, 0, padded - seq_len))
+    values_tiles = torch.nn.functional.pad(values, (0, 0, 0, padded - seq_len))
+    phi_k_tiles = phi_k_tiles.reshape(batch_heads, num_tiles, build_tile, stacked)
+    values_tiles = values_tiles.reshape(batch_heads, num_tiles, build_tile, head_dim)
+
+    # B: one MMA per 16 keys added to the running accumulator. A: thread
+    # (group g, slot c) sums tokens g, g + rows_per_pass, ... of the tile in
+    # order; the groups are then added in group order.
+    weighted = torch.zeros(batch_heads, num_tiles, stacked, head_dim)
+    for begin in range(0, build_tile, TC_FRAG):
+        block = slice(begin, begin + TC_FRAG)
+        weighted = weighted + phi_k_tiles[:, :, block].transpose(-1, -2) @ values_tiles[:, :, block]
+    group_mass = []
+    for group in range(rows_per_pass):
+        running = torch.zeros(batch_heads, num_tiles, stacked)
+        for token in range(group, build_tile, rows_per_pass):
+            running = running + phi_k_tiles[:, :, token]
+        group_mass.append(running)
+    mass = group_mass[0]
+    for running in group_mass[1:]:
+        mass = mass + running
+
+    # Workspace [T, BH, L, R * (D + 1)] and the same tree as the fp32 path.
+    workspace = torch.empty(num_tiles, batch_heads, num_tables, corners * (head_dim + 1))
+    workspace[..., : corners * head_dim] = weighted.permute(1, 0, 2, 3).reshape(
+        num_tiles, batch_heads, num_tables, -1
+    )
+    workspace[..., corners * head_dim :] = mass.permute(1, 0, 2).reshape(
+        num_tiles, batch_heads, num_tables, corners
+    )
+    tiles = list(workspace.unbind(0))
+    tree_reduce(tiles, num_tiles, lambda a, b: b if a is None else (a if b is None else a + b))
+    totals = tiles[0]
+    buckets = totals[..., : corners * head_dim].reshape(batch_heads, stacked, head_dim)
+    total_mass = totals[..., corners * head_dim :].reshape(batch_heads, stacked)
+
+    # Query: Num by MMAs over 16-corner k-steps with B split into hi + lo;
+    # Den by lanes over slots l, l + 32, ... and the warp butterfly.
+    queries = q.float().reshape(batch_heads, seq_len, head_dim)
+    phi_q = corner_probs_tc(queries, W, beta)
+    buckets_hi, buckets_lo = split_bf16(buckets)
+    padded_corners = -(-stacked // TC_FRAG) * TC_FRAG
+    pad = (0, 0, 0, padded_corners - stacked)
+    buckets_hi = torch.nn.functional.pad(buckets_hi, pad)
+    buckets_lo = torch.nn.functional.pad(buckets_lo, pad)
+    phi_q_padded = torch.nn.functional.pad(phi_q, (0, padded_corners - stacked))
+    numer = torch.zeros(batch_heads, seq_len, head_dim)
+    for begin in range(0, padded_corners, TC_FRAG):
+        block = slice(begin, begin + TC_FRAG)
+        numer = numer + phi_q_padded[..., block] @ buckets_hi[:, block]
+        numer = numer + phi_q_padded[..., block] @ buckets_lo[:, block]
+    den_lanes = torch.zeros(batch_heads, seq_len, 32)
+    for slot in range(stacked):
+        lane = slot % 32
+        den_lanes[..., lane] = den_lanes[..., lane] + phi_q[..., slot] * total_mass[:, None, slot]
+    den = butterfly_sum(den_lanes).unsqueeze(-1)
+    inv_den = torch.where(den == 0, torch.zeros_like(den), 1.0 / den)
+    out32 = (numer * inv_den).reshape(batch, heads, seq_len, head_dim)
+    return (
+        out32.to(torch.bfloat16),
+        out32,
+        total_mass.reshape(batch, heads, num_tables, corners),
+        buckets.reshape(batch, heads, num_tables, corners, head_dim),
+        phi_q,
+        phi_k,
+    )
+
+
+@pytest.mark.parametrize(
+    "head_dim, num_planes, num_tables, seq_len, build_tile, beta",
+    [
+        (64, 1, 1, 127, 64, 1.0),
+        (64, 2, 2, 129, 64, 1.0),
+        (128, 4, 4, 1000, 64, 1.0),
+        (128, 5, 4, 1000, 32, 4.0),
+        (64, 5, 3, 2049, 2048, 1.0 / 8.0),
+        (64, 3, 3, 3001, 2048, 4.0),
+        (128, 5, 4, 10000, 2048, 1.0),
+        (128, 4, 4, 10000, 2048, 4.0),
+    ],
+)
+def test_emulated_tc_pipeline_matches_reference(head_dim, num_planes, num_tables, seq_len,
+                                                build_tile, beta):
+    q, k, v, W = make_bf16_inputs(12, 2, 2, seq_len, head_dim, num_tables, num_planes)
+    q64, k64, v64, W64 = q.double(), k.double(), v.double(), W.double()
+    ref = race_forward_reference(q64, k64, v64, W64, torch.tensor(beta, dtype=torch.float64))
+    delta, ref_mass, ref_weighted, ref_weighted_abs, rounding_bound = tc_statistics(
+        q, k, v, W, beta
+    )
+    out, out32, mass, weighted, phi_q, phi_k = emulate_forward_tc(q, k, v, W, beta, build_tile)
+
+    assert_buckets_close_tc(mass, weighted, ref_mass, ref_weighted, ref_weighted_abs, v, delta)
+    assert_output_close_tc(out, ref, rounding_bound, v, beta)
+
+    # The fp32 part: the emulated fp32 output against fp64 arithmetic on the
+    # same rounded phi (exact B, so this also contains the 2^-16 split of B).
+    # It must stay under 10% of the fp32 atol the bound reuses.
+    batch_heads = q.shape[0] * q.shape[1]
+    values = v64.reshape(batch_heads, seq_len, head_dim)
+    same_mass = phi_k.double().sum(dim=1)
+    same_weighted = phi_k.double().transpose(1, 2) @ values
+    same_out = (phi_q.double() @ same_weighted) / (phi_q.double() @ same_mass.unsqueeze(-1))
+    fp32_error = (out32.double() - same_out.reshape(ref.shape)).abs()
+    assert (fp32_error <= 0.1 * output_atol(v, beta)).all()
