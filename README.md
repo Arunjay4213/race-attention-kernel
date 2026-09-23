@@ -131,24 +131,25 @@ The design is in `docs/noncausal_design.md`.
 
 ## Status
 
-Everything under `src/` has now run on three GPUs: an A10G, an L4, and an A100-SXM4-40GB, the same model as the Phase 1 baseline.
-All test suites pass on each (1268 non-causal, 773 causal on the A100), compute-sanitizer reports nothing, and every kernel compiles for sm_80, sm_86, sm_89 and sm_90 with no register spills.
-The full reports are [`benchmarks/a10g_first_run.md`](benchmarks/a10g_first_run.md) and [`benchmarks/a100_first_run.md`](benchmarks/a100_first_run.md).
+Everything under `src/` has run on four GPUs: an A10G, an L4, and an A100-SXM4-40GB, the same model as the Phase 1 baseline.
+All test suites pass on each (2170 non-causal, 1717 causal on the A100), compute-sanitizer reports nothing, and every kernel compiles for sm_80, sm_86, sm_89 and sm_90 with no register spills.
+The reports are [`benchmarks/a10g_first_run.md`](benchmarks/a10g_first_run.md), [`benchmarks/a100_first_run.md`](benchmarks/a100_first_run.md) and [`benchmarks/a100_tensor_cores.md`](benchmarks/a100_tensor_cores.md).
 
 The headline against the baseline table above, on the A100-40GB where the reference runs out of memory at T = 131072:
 
 | causal forward, d = 64, P = 4, L = 4, 8 streams | T = 2097152 |
 |---|---|
-| chunk-parallel kernel (v2) | 91.9 ms, 8.13 GiB peak, 183 Mtok/s |
-| chunked PyTorch forward, fp32 | 3649 ms, 36.0 GiB peak |
+| chunk-parallel kernel, tensor cores (v2b) | 22.9 ms, 8.13 GiB peak, 731 Mtok/s |
+| chunk-parallel kernel, fp32 cores (v2a) | 92.0 ms, 8.13 GiB peak, 182 Mtok/s |
+| chunked PyTorch forward, fp32 | 3656 ms, 36.0 GiB peak |
 | one-block-per-stream prototype (v1) | 1.08 Mtok/s at every length |
 
-So the 2M-token forward runs in 8 GiB, 16× past the reference's wall, at about 40× the throughput of the memory-light PyTorch version and 170× the prototype.
+So the 2M-token forward runs in 8 GiB, 16× past the reference's wall, at 160× the throughput of the memory-light PyTorch version and about 680× the prototype.
 
-What is not there yet is bandwidth.
-On the A100 the non-causal forward reaches 38% of HBM peak at P = 2, L = 2 and 9% at P = 4, L = 4; the causal kernel sits at 9-13%.
-The profiles show why: at these configurations the hash projections, sigmoids, corner products and the R × d dot products are compute-bound on fp32 cores, which is what the regime analysis in `docs/` predicted.
-The three heavy stages are small matrix products over a tile of tokens, and moving them onto tensor cores is the next step.
+Bandwidth: the non-causal tensor-core forward reaches 80% of the A100's HBM peak at P = 2, L = 2 and 52% at P = 4, L = 4, up from 38% and 9% on fp32 cores.
+The causal tensor-core kernel reaches 38% of peak counting the bytes it actually moves, up from 9%.
+The three heavy stages (hash projection, bucket accumulation, query mixing) run on wmma bf16 fragments with fp32 accumulation, with the hash planes and the bucket state split into bf16 hi + lo pairs so the projection and the carry keep fp32-level accuracy; the tolerance derivations are in the tests.
+The fp32-core paths remain the defaults until a training run shows the bf16 rounding of the hash weights is harmless.
 
 ## Credit
 
