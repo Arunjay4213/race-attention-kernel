@@ -73,6 +73,7 @@ stage_bench() {
     run bench_noncausal_forward $PY src/noncausal/bench/bench_forward.py
     [ -f "$PROJECT/src/noncausal/bench/bench_backward.py" ] && run bench_noncausal_backward $PY src/noncausal/bench/bench_backward.py
     run bench_causal_v2 $PY src/causal_v2/bench/bench_causal.py
+    run bench_causal_v2b $PY src/causal_v2/bench/bench_causal.py --variant v2b --skip-baseline
     # The v1 prototype is the "before" number the causal v2 speedup is quoted against.
     run bench_causal_v1 $PY src/bench_causal_v1.py
 }
