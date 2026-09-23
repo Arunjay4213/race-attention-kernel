@@ -41,7 +41,9 @@ run() {
     local rc=${PIPESTATUS[0]}
     echo "$name exit=$rc" | tee -a "$RESULTS/session.log"
 }
-have() { command -v "$1" >/dev/null 2>&1; }
+# A tool counts only if it runs: some containers keep a CUDA wrapper script
+# whose real binary was stripped, so `command -v` alone would pass.
+have() { "$1" --version >/dev/null 2>&1; }
 skip() { echo "skipped $1: $2" | tee -a "$RESULTS/session.log"; }
 
 stage_build() {
@@ -56,7 +58,7 @@ stage_build() {
 
 stage_sanitize() {
     # Small cases only (infra/sanitize_cases.py): the sanitizer tools are 10-100x slower than a plain run.
-    if ! have compute-sanitizer; then skip sanitize "compute-sanitizer not on PATH"; return; fi
+    if ! have compute-sanitizer; then skip sanitize "compute-sanitizer missing or broken"; return; fi
     for tool in memcheck racecheck synccheck; do
         run "sanitize_$tool" compute-sanitizer --tool "$tool" --error-exitcode 1 $PY infra/sanitize_cases.py
     done
@@ -80,14 +82,14 @@ stage_profile() {
     # ncu also needs GPU performance-counter access, which containers usually deny
     # (ERR_NVGPUCTRPERM); that shows up as a nonzero exit in the ncu logs, not a skip.
     if ! have ncu; then
-        skip ncu "ncu not on PATH"
+        skip ncu "ncu missing or broken"
     else
         run ncu_noncausal ncu --set full --launch-count 6 --export "$RESULTS/ncu_noncausal" --force-overwrite \
             $PY src/noncausal/bench/bench_forward.py --min-log2 18 --max-log2 18
         run ncu_causal ncu --set full --launch-count 6 --export "$RESULTS/ncu_causal" --force-overwrite \
             $PY src/causal_v2/bench/bench_causal.py --min-log2 18 --max-log2 18 --skip-baseline
     fi
-    if ! have nsys; then skip nsys "nsys not on PATH"; return; fi
+    if ! have nsys; then skip nsys "nsys missing or broken"; return; fi
     run nsys_causal nsys profile --stats=true -o "$RESULTS/nsys_causal" --force-overwrite true \
         $PY src/causal_v2/bench/bench_causal.py --min-log2 20 --max-log2 20 --skip-baseline
 }
