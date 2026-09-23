@@ -4,7 +4,10 @@ The full pytest suites are far too slow under memcheck/racecheck, so this runs
 only the shapes that exercise the risky paths: tails that are not a multiple of
 a tile or sub-chunk, the half-idle (d=64, P=1) instantiation, the largest
 shared-memory configuration, and the multi-level reduce.
-Each call is checked for finiteness only; correctness is the test suites' job.
+The non-causal extension runs forward_train and then backward (with v as the
+output gradient) so the backward's per-warp scratch and __syncwarp ordering is
+checked too. Each call is checked for finiteness only; correctness is the
+test suites' job.
 """
 from __future__ import annotations
 
@@ -40,6 +43,8 @@ CASES = [
     (1, 17, 64, 2, 2),      # one token into a second staging batch
     (1, 65, 128, 4, 3),     # L = 3 (state size not a multiple of the pass size), sub-chunk tail
     (4, 20000, 64, 4, 4),   # multi-level reduce / several tiles per stream
+    (1, 2049, 128, 4, 4),   # largest d = 128 causal footprint that fits a 99 KB opt-in GPU (C = 32), tile tail
+    (1, 100, 64, 5, 4),     # largest causal footprint overall that fits 99 KB (84224 bytes, C = 32), sub-chunk tail
 ]
 
 
@@ -49,9 +54,12 @@ def main() -> None:
     beta = torch.tensor(1.0, device="cuda")
     for bh, n, d, p, l in CASES:
         q, k, v, w = inputs(bh, n, d, p, l, seed=n)
-        out = noncausal.forward(q, k, v, w, beta)
+        out, bucket_totals = noncausal.forward_train(q, k, v, w, beta)
         torch.cuda.synchronize()
         assert torch.isfinite(out).all(), f"noncausal non-finite at {(bh, n, d, p, l)}"
+        grads = noncausal.backward(v, q, k, v, w, beta, bucket_totals)
+        torch.cuda.synchronize()
+        assert all(torch.isfinite(g).all() for g in grads), f"noncausal backward non-finite at {(bh, n, d, p, l)}"
         try:
             out = causal.forward(q, k, v, w, beta, 0)
         except RuntimeError as err:  # configuration refused on this GPU (shared memory)

@@ -532,11 +532,15 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // Sets the dynamic shared memory limit when a launch needs more than the
-// default. The attribute is per device, so it is set on every call rather
+// default. The 48 KB default bounds static plus dynamic shared memory, and
+// both per-token kernels also hold warp_beta_s statically, so a dynamic size
+// of exactly 48 KB (D = 64, P = 5, L = 4 in query_grad_kernel) already needs
+// the opt-in. The attribute is per device, so it is set on every call rather
 // than cached.
 template <typename Kernel>
 cudaError_t opt_in_dynamic_smem(Kernel* kernel, size_t smem_bytes) {
-    if (smem_bytes <= kDefaultDynamicSmemBytes) return cudaSuccess;
+    constexpr size_t kStaticSmemBytes = kWarps * sizeof(float);  // warp_beta_s
+    if (smem_bytes + kStaticSmemBytes <= kDefaultDynamicSmemBytes) return cudaSuccess;
     return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 static_cast<int>(smem_bytes));
 }
