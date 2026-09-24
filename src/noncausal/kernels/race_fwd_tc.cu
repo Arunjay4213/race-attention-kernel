@@ -40,8 +40,6 @@
 //     128 bytes.
 //   - Constant operands stay in registers for the whole CTA: the plane
 //     fragments in both kernels and the B fragments in the query pass.
-//   - No atomics; every sum has a fixed order, so results are bitwise
-//     reproducible.
 #include "race_fwd_tc.h"
 
 #include <mma.h>
@@ -65,7 +63,6 @@ using detail::kWarps;
 using detail::token_row_offset;
 using detail::workspace_slice_offset;
 
-// wmma tile edge: m = n = k = 16.
 constexpr int kFrag = 16;
 // Tokens per stage. Two row tiles, so the projection and the query output
 // split into 8 fragments' worth of work for the 8 warps (see TcDims).
@@ -585,7 +582,6 @@ struct BucketFragments {
     FragRowB lo[TcDims<D, P, L>::kCornerTiles];
 };
 
-// Rounds 8 fp32 values to bf16 and stores them with one 16-byte store.
 __device__ __forceinline__ void store_bf16x8(bf16* dst, const float (&src)[8]) {
     uint4 raw;
     const __nv_bfloat162 pairs[4] = {

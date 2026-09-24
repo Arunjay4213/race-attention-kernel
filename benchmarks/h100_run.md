@@ -3,7 +3,7 @@
 Date: 2026-09-24.
 Hardware: one NVIDIA H100 80GB HBM3 (sm_90, 3350 GB/s peak HBM, 227 KB opt-in shared memory per block) on an EC2 p5.4xlarge spot instance.
 Software: PyTorch 2.12.1+cu130 with the CUDA 13.0 toolkit from the Deep Learning AMI, Python 3.13.
-Every number comes from that session.
+All numbers below are from that instance.
 This is the first run of the sm_90 code path; every earlier run was on sm_80, sm_86 or sm_89.
 
 ## Correctness

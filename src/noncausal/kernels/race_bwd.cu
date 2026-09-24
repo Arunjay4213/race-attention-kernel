@@ -44,8 +44,7 @@
 // layout, so lanes r >= R carry copies and sums over corners are butterflies
 // over the low P lane bits (corner_allreduce_sum).
 //
-// Precision: bf16 in and out, fp32 everywhere in between, accurate tanhf and
-// expf. No atomics anywhere.
+// Precision and reproducibility rules are the forward's (race_fwd.cu).
 #include "race_bwd.h"
 
 #include <algorithm>
@@ -166,8 +165,7 @@ __device__ __forceinline__ void sigmoid_pair_no_call(float z, float& prob_plus,
 // order) except for the reciprocal in the sigmoids, so u is bitwise the
 // forward's and phi agrees to a few ulp. Each plane's values go to shared
 // memory as soon as they exist and phi is built as a running product, so
-// little state is live across the next plane's transcendentals. Must be
-// called by all 32 lanes.
+// little state is live across the next plane's transcendentals.
 template <int D, int P>
 __device__ __forceinline__ float hash_to_scratch(const float (&row)[D / kWarpSize],
                                                  const float* table_planes, float beta,
@@ -229,7 +227,7 @@ __device__ __forceinline__ void load_totals(const float* __restrict__ head_total
 // `weighted_grad` is phi[corner] * dphi[corner] in corner layout. h_t, and so
 // beta_grad and dL/dz_t, is bitwise identical on every lane. 1 - u^2 is one
 // fma: its absolute error stays below 2^-23 even where tanh saturates, which
-// is small against its natural scale of 1. Must be called by all 32 lanes.
+// is small against its natural scale of 1.
 template <int P>
 __device__ __forceinline__ void hash_grad_to_scratch(float weighted_grad, const float* table_hash,
                                                      int corner, float beta, int lane,
@@ -452,7 +450,6 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksPerSm)
     const int tile_end = min(seq_len, tile_begin + kQueryTileTokens);
     float beta_grad = 0.0f;  // identical on all lanes of the warp
 
-    // Warp-uniform loop: only __syncwarp inside, no block barriers.
     for (int token = tile_begin + warp; token < tile_end; token += kWarps) {
         const size_t row = token_row_offset(bh, token, seq_len, D) + lane * kVec;
         float value[kVec];
@@ -535,8 +532,7 @@ __global__ void __launch_bounds__(kThreads)
 // default. The 48 KB default bounds static plus dynamic shared memory, and
 // both per-token kernels also hold warp_beta_s statically, so a dynamic size
 // of exactly 48 KB (D = 64, P = 5, L = 4 in query_grad_kernel) already needs
-// the opt-in. The attribute is per device, so it is set on every call rather
-// than cached.
+// the opt-in.
 template <typename Kernel>
 cudaError_t opt_in_dynamic_smem(Kernel* kernel, size_t smem_bytes) {
     constexpr size_t kStaticSmemBytes = kWarps * sizeof(float);  // warp_beta_s

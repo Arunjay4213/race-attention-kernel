@@ -66,5 +66,5 @@ It launches 8 blocks for 108 SMs and walks each stream one token at a time, so i
 The kernels are compute-bound on fp32 cores at every configuration on this GPU, more so than on the A10G because the A100 has 2.6× the bandwidth for a similar fp32 rate.
 P = 2, L = 2 reaches 38% of HBM peak in the forward; P = 4, L = 4 reaches 9%.
 The ncu profiles on the A10G show where the time goes: the hash projections, tanh and sigmoid, the corner products, and the R × d dot products in the bucket build and query pass, all on CUDA cores.
-Those three heavy stages are small matrix products over a tile of tokens, which is what the tensor-core versions replace.
+Those three heavy stages are small matrix products over a tile of tokens; they are what the tensor-core versions move onto wmma.
 The 2M-token memory result does not depend on that: it is set by the 4 KB per token of I/O and holds for the fp32-core kernels as they are.

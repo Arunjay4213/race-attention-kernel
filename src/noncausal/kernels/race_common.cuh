@@ -8,6 +8,7 @@
 //     (P - 1 - t) of r is set (plane 0 is the most significant bit), matching
 //     itertools.product([-1, +1], repeat=P) in the reference.
 //   - All arithmetic is fp32 with accurate tanhf / expf (no fast-math).
+//   - The warp helpers use full-mask shuffles, so all 32 lanes call them.
 #pragma once
 
 #include <cuda_bf16.h>
@@ -55,7 +56,6 @@ __device__ __forceinline__ void load_bf16_vec(const __nv_bfloat16* src, float (&
     }
 }
 
-// Rounds VEC fp32 values to bf16 (round to nearest even) and stores them.
 template <int VEC>
 __device__ __forceinline__ void store_bf16_vec(__nv_bfloat16* dst, const float (&src)[VEC]) {
     static_assert(VEC == 2 || VEC == 4, "bf16 vector width must be 2 or 4");
@@ -95,7 +95,6 @@ __device__ __forceinline__ void load_f32_vec(const float* src, float (&dst)[COUN
     }
 }
 
-// Stores COUNT consecutive fp32 values to shared memory, alignment as above.
 template <int COUNT>
 __device__ __forceinline__ void store_f32_vec(float* dst, const float (&src)[COUNT]) {
     if constexpr (COUNT % 4 == 0) {
@@ -142,7 +141,6 @@ __device__ __forceinline__ float bernoulli_product(const float (&prob_plus)[P],
 // at the table's P x D planes in shared memory. Each projection is a warp-wide
 // dot product; after the all-reduce every lane holds the same u_t, and lane r
 // evaluates corner r. Lanes r >= R return a value the caller must discard.
-// Must be called by all 32 lanes (it uses full-mask shuffles).
 template <int D, int P>
 __device__ __forceinline__ float corner_probability(const float (&row)[D / kWarpSize],
                                                     const float* planes, float beta, int lane) {
@@ -179,8 +177,7 @@ __device__ __forceinline__ float corner_coefficient(float prob_plus, float prob_
 // consecutive lanes holds one copy of all R values. A butterfly over the low
 // P lane bits sums one copy; the groups hold identical copies and run
 // identical operations, and both partners at each level add the same two
-// operands, so every lane ends with the same bitwise result. Must be called
-// by all 32 lanes.
+// operands, so every lane ends with the same bitwise result.
 template <int P>
 __device__ __forceinline__ float corner_allreduce_sum(float value) {
 #pragma unroll
@@ -210,8 +207,7 @@ __device__ __forceinline__ float corner_allreduce_sum(float value) {
 //
 // `partial(r)` must return this lane's partial for corner r; it is called
 // exactly once per corner, in the order 0, 1, ..., R - 1. Every lane with the
-// same l & (R - 1) ends with the same bitwise result. Must be called by all
-// 32 lanes.
+// same l & (R - 1) ends with the same bitwise result.
 template <int P, typename PartialFn>
 __device__ __forceinline__ float corner_reduce_scatter(int lane, PartialFn&& partial) {
     constexpr int kCorners = 1 << P;

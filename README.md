@@ -144,7 +144,7 @@ The headline against the baseline table above, on the A100-40GB where the refere
 | chunked PyTorch forward, fp32 | 3656 ms, 36.0 GiB peak |
 | one-block-per-stream prototype (v1) | 1.08 Mtok/s at every length |
 
-So the 2M-token forward runs in 8 GiB, 16× past the reference's wall, at 160× the throughput of the memory-light PyTorch version and about 680× the prototype.
+So the 2M-token forward runs in 8 GiB, 16x past the reference's wall, at 160x the throughput of the memory-light PyTorch version and about 680x the prototype.
 
 Bandwidth: the non-causal tensor-core forward reaches 80% of the A100's HBM peak at P = 2, L = 2 and 52% at P = 4, L = 4, up from 38% and 9% on fp32 cores.
 The causal tensor-core kernel reaches 38% of peak counting the bytes it actually moves, up from 9%.

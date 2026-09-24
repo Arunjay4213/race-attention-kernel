@@ -33,14 +33,15 @@
 //   K3 output_pass_kernel: one CTA per (tile, stream), 256 threads, dynamic
 //      shared memory, fp32 CUDA cores. Phi is recomputed, never stored.
 //
-// Precision: bf16 in and out, fp32 everywhere in between, accurate tanhf and
-// expf, one reciprocal per token, one bf16 rounding per output. No atomics.
+// Precision rules are the non-causal kernels' (bf16 in and out, fp32 between,
+// no fast-math, no atomics), with one reciprocal per token and one bf16
+// rounding per output.
 // K1 and K3 compute Phi_K with different fp32 operation orders (warp
 // butterfly vs one thread's serial dot product). That is harmless: each
 // contribution enters A and B with the same Phi value, so Num and Den stay
 // consistent and a constant V still comes back exactly.
 //
-// Differences from docs/causal_v2_design.md section 6.2, each for a concrete reason:
+// Departures from docs/causal_v2_design.md section 6.2:
 //   - Den is computed in the G step instead of a separate step: the 16
 //     threads that hold one row of G add their G entries and a strided share
 //     of Phi_Q . A, then a 16-lane shuffle reduction. This drops one barrier

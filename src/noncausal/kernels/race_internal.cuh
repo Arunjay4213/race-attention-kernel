@@ -107,10 +107,6 @@ cudaError_t dispatch_shape(const ForwardShape& shape, Fn&& fn) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bucket build
-// ---------------------------------------------------------------------------
-
 // Computes phi and copies v for the kStageTokens tokens starting at
 // stage_begin. Warp w handles stage slots w, w + kWarps, ...; slots past
 // tile_end get phi = 0 and v = 0 so the accumulation needs no masking (and

@@ -3,7 +3,7 @@
 Date: 2026-09-22.
 Hardware: one NVIDIA A10G (sm_86, 24 GB, 99 KB opt-in shared memory per block, 600 GB/s peak HBM) on a SageMaker ml.g5.xlarge.
 Software: torch 2.10.0+cu128, nvcc 12.8, Python 3.10, compute-sanitizer and ncu from CUDA 13.2.
-Every number below comes from a run in this session.
+All numbers below are from this run.
 The raw logs are kept outside the repository.
 
 ## Result per suite

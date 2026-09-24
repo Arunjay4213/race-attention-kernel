@@ -144,7 +144,7 @@ Structural tests, for both variants: constant V must come back exactly (v2b with
 ## v2b: tensor cores
 
 v2a computes every product on fp32 CUDA cores, so its error is limited by the bf16 output rounding alone, and a wrong mask, boundary, scan offset or tail shows up as a clear failure.
-On the A10G it is compute-bound at P = 4, L = 4 (its output pass was MIO-throttled at 16.7% occupancy), which is what v2b addresses.
+On the A10G it is compute-bound at P = 4, L = 4 (its output pass was MIO-throttled at 16.7% occupancy); v2b exists to fix that.
 v2b replaces K1 and K3 with `nvcuda::wmma` kernels (bf16 16×16×16 fragments, fp32 accumulation) and keeps K2, the workspace layout and the tile logic.
 The kernel file's header comment (`kernels/race_causal_fwd_tc.cu`) documents the shared-memory layout, the warp mapping and the reasons for each choice; the summary:
 

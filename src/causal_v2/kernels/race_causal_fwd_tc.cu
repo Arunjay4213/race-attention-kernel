@@ -323,7 +323,6 @@ struct TcTraits {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-// 8 floats rounded to bf16 and packed into one 16-byte vector.
 __device__ __forceinline__ uint4 pack_bf16x8(const float (&values)[8]) {
     uint32_t words[4];
 #pragma unroll

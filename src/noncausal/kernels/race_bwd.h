@@ -23,11 +23,10 @@
 //   race_bucket_reduce     -> deterministic tree over tiles (race_fwd.h)
 //   race_key_grad          -> dk, dv, key-side beta partials
 //   race_beta_grad_reduce  -> d beta
-// Results are bitwise reproducible: no atomics, fixed summation orders.
+// No atomics and fixed summation orders, as in the forward, so the gradients
+// are bitwise reproducible too.
 //
-// Supported shapes and alignment are those of race_fwd.h (is_supported).
-// Each launcher returns the first CUDA error it hits (cudaErrorInvalidValue
-// for unsupported shapes) and never synchronizes.
+// Shape limits, alignment and the error contract are those of race_fwd.h.
 #pragma once
 
 #include <cuda_bf16.h>

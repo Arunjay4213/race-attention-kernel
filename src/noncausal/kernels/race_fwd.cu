@@ -22,7 +22,7 @@
 // Precision: bf16 in and out, fp32 everywhere in between, accurate tanhf and
 // expf. No atomics anywhere.
 //
-// Differences from docs/noncausal_design.md, each for a concrete reason:
+// Where this departs from docs/noncausal_design.md, and why:
 //   - The build keeps B in registers (each thread owns fixed (r, c) slots for
 //     the whole tile) instead of a shared B[R][D + 1]: the plan's staging and
 //     slot ownership already make every slot private to one thread, so shared

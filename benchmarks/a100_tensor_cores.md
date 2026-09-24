@@ -3,7 +3,7 @@
 Date: 2026-09-23.
 Hardware: one NVIDIA A100-SXM4-40GB (sm_80, 1555 GB/s peak HBM) on a SageMaker ml.p4d.24xlarge training job, one of the eight GPUs.
 Software: the PyTorch 2.8.0+cu129 Deep Learning Container, nvcc 12.9.
-Every number comes from that job (686 billed seconds).
+The job was billed 686 seconds and produced everything below.
 The fp32-core numbers are from the same job and match the earlier run in `a100_first_run.md` within 1%.
 
 ## Correctness

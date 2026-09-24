@@ -129,7 +129,7 @@ It comes with the harness: a P × L × d × N cross-product including N ∈ {127
 
 ## What the implementation changed
 
-The kernels in `src/noncausal/kernels/` follow this design with these differences, each for a concrete reason (from the header of `race_fwd.cu` and from `src/noncausal/README.md`):
+The kernels in `src/noncausal/kernels/` follow this design with these differences (the reasons are in the header of `race_fwd.cu` and in `src/noncausal/README.md`):
 
 - The bucket build keeps B in registers (each thread owns fixed (r, c) slots for the whole tile) instead of a shared B[R][d+1].
   The staging and slot ownership of section 3 already make every slot private to one thread, so shared memory would only add a load and a store per FMA.

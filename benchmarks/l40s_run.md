@@ -3,7 +3,7 @@
 Date: 2026-09-23.
 Hardware: one NVIDIA L40S (sm_89, 48 GB, 864 GB/s peak HBM, 99 KB opt-in shared memory per block) on a SageMaker ml.g6e.xlarge training job.
 Software: the PyTorch 2.8.0+cu129 Deep Learning Container, nvcc 12.9.
-Every number comes from that job (611 billed seconds).
+611 billed seconds.
 
 ## Correctness
 
@@ -28,7 +28,7 @@ Every number comes from that job (611 billed seconds).
 
 The chunked PyTorch baseline at d = 64 takes 4089 ms and 36.0 GiB, so v2b is 220× faster here.
 
-## What the numbers say
+## Why the L40S beats the A100 here
 
 On this GPU the tensor-core kernels are memory-bound at every configuration: 77-84% of HBM peak.
 The L40S has 56% of the A100's bandwidth but a similar per-SM compute rate, so the CUDA-core phases and barriers that limit the A100 run to 38-52% are hidden behind memory traffic here.

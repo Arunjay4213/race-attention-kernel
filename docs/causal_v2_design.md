@@ -2,7 +2,7 @@
 
 This is the design I worked out before writing the causal v2 kernels in `src/causal_v2/`.
 It plays the same role for the causal kernels that `docs/noncausal_design.md` plays for the non-causal ones, and I keep it as the reference for why the code looks the way it does.
-The code departs from it in a few places, each for a concrete reason, and the last section lists those departures.
+The code departs from it in a few places; the last section lists them and says why.
 Scope: the forward pass in two builds (v2a on fp32 CUDA cores, v2b on bf16 tensor cores), a backward outline, and the test and benchmark plan.
 No GPU was used for the design.
 Every number is either paper arithmetic (formulas in Appendix A) or the output of small CPU experiments (listed in Appendix B).
@@ -928,7 +928,7 @@ The β-gap tables, the v2a / v2b bf16 simulation, the error attribution and the 
 ## What the implementation changed
 
 `src/causal_v2/` implements both builds.
-v2a follows this design with these differences, each for a concrete reason (from the header of `src/causal_v2/kernels/race_causal_fwd.cu` and from `src/causal_v2/README.md`):
+v2a follows this design with these differences (the reasons are in the header of `src/causal_v2/kernels/race_causal_fwd.cu` and in `src/causal_v2/README.md`):
 
 - **Den is computed in the G step** instead of a separate step (section 6.2).
   The 16 threads that hold one row of G add their G entries and a strided share of Φ_Q · A, then a 16-lane shuffle reduction finishes the row.
