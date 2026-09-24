@@ -235,8 +235,8 @@ The next steps are `ldmatrix` + `mma.sync` with documented fragment layouts (the
 
 ## Known untested
 
-- v2a and v2b have run on an A10G (sm_86), an L40S (sm_89) and an A100 (sm_80); sm_90 is compiled but not run.
-  See `benchmarks/a100_tensor_cores.md` and `benchmarks/l40s_run.md`.
+- v2a and v2b have run on an A10G (sm_86), an L40S (sm_89), an A100 (sm_80) and an H100 (sm_90).
+  See `benchmarks/a100_tensor_cores.md`, `benchmarks/l40s_run.md` and `benchmarks/h100_run.md`.
 - v2b with the default hi/lo carry for d = 128, P = 5 with L ≥ 3 needs more than 99 KiB of shared memory and has only been compiled; its output pass without the register prefetch (`TcTraits::prefetch_rows`) has run on the A10G only in the single-carry build.
 - The v2b launch shapes were chosen from A10G measurements for the smallest per-SM shared memory of the targets; with 164 KiB (A100) or 228 KiB (H100) per SM, C = 64 with 2 CTAs per SM might be faster and has not been measured.
 - compute-sanitizer has run on the default build only, not on the single-carry build.
