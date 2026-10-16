@@ -1,31 +1,29 @@
-# RACE Attention Kernel
+# RACE Attention kernel
 
-Fusing RACE attention's causal forward pass into a single CUDA kernel, so that a single GPU can handle a longer context.
+This project fuses RACE Attention's causal forward pass into one CUDA kernel so that a single GPU can handle a longer context.
 
 RACE Attention ([ICLR 2026](https://openreview.net/forum?id=RR8Lh8RHgA), [arXiv:2510.04008](https://arxiv.org/abs/2510.04008)) is a strictly linear-time attention mechanism.
-Linear time is not the same as small memory, though.
+Linear time does not guarantee small memory, though.
 The reference implementation's causal path allocates a five-dimensional prefix-sum tensor that grows by about 128 KB per token, and on a 40 GB A100 that runs out of memory at 131072 tokens.
-The tensor is written once and read once, which means it does not need to exist at all.
+Every entry of that tensor is written once and read once, so the full tensor never needs to exist.
 
 This repository holds the measurement and analysis work behind a fused kernel that removes it.
 
 ## Findings
 
 I traced the reference implementation, [sahiljoshi515/RACE_Attention](https://github.com/sahiljoshi515/RACE_Attention), at commit `b24a3d0`, to find out what the existing kernels cover before writing a new one.
-The full walkthrough with citations is in [`analysis/hot-path.md`](analysis/hot-path.md).
-The summary:
+The full walkthrough with citations is in [`analysis/hot-path.md`](analysis/hot-path.md), and the short version follows.
 
-**The shipped CUDA kernels never run.**
+First, the CUDA kernels that ship with it never run.
 `kernels/gpu/forward_kernel.cu` and `kernels/gpu/backward_kernels.cu` are real, reasonable CUDA, but nothing compiles or calls them.
 There is no CUDA build step anywhere in the repository (the only `setup.py`, at `kernels/cpu/setup.py`, builds C++ for the CPU).
 Neither `.cu` file declares a `PYBIND11_MODULE` or `TORCH_LIBRARY` block, so there is no symbol for Python to import.
 And no file in the repository, notebooks and README included, mentions `forward_kernel`, `race_fused_fwd`, or `kernels/gpu` at all.
 
-**The CPU extension is dead too.**
-`kernels/cpu/race_ext.py:23` and `:31` pass `sources=[""]` to `torch.utils.cpp_extension.load`, so the C++ never builds either.
-Its call site in `misc/race.py:114-133` is commented out regardless.
+The CPU extension is dead too.
+`kernels/cpu/race_ext.py:23` and `:31` pass `sources=[""]` to `torch.utils.cpp_extension.load`, so the C++ never builds, and its call site in `misc/race.py:114-133` is commented out anyway.
 
-**The real path is PyTorch `cumsum` plus `bmm`.**
+What actually runs is PyTorch `cumsum` plus `bmm`.
 Every model runs `BatchedACE.forward` in `misc/race.py:63-142`, reached from `misc/lm.py:16` via `RACEBlock` and `RACEAttention`.
 The expensive lines are `misc/race.py:108-110`:
 
@@ -38,7 +36,7 @@ E_pref = B_pref.div(A_pref.unsqueeze(-1).add(1e-6))                           # 
 `B_pref` is five-dimensional, `[N, T, L, R, d_k]`.
 The broadcast multiply materializes the whole thing before `cumsum` even starts, `E_pref` makes a second copy, and the `.contiguous()` at `misc/race.py:137` makes a third.
 
-**Nothing ever needs the whole table.**
+Nothing ever needs the whole table, though.
 The only consumer is the lookup at `misc/race.py:135-138`, which contracts one timestep of `E_pref` against one timestep of `probsQ` and discards the rest:
 
 ```python
@@ -50,20 +48,19 @@ out2 = torch.bmm(
 
 So the `T` axis of that tensor is pure overhead.
 A kernel that carries the running sums `A` and `B` in registers and emits each output before advancing can drop it entirely.
-The unused `race_fused_fwd_cuda` at `kernels/gpu/forward_kernel.cu:19-62` already sketches exactly this, which is a useful starting point.
+The unused `race_fused_fwd_cuda` at `kernels/gpu/forward_kernel.cu:19-62` already sketches exactly this, and it is a reasonable place to start.
 
-One caveat worth stating: this is specific to the causal path.
+All of this applies only to the causal path.
 The non-causal variants used for classification and vision reduce over the full sequence in one step (`scaling/benchmark_time.py:155-162`) and are already memory-light.
 
 ## Baseline results
 
-Measured on a single NVIDIA A100-SXM4-40GB (42.4 GB reported, compute capability 8.0) with torch 2.11.0+cu128.
-Configuration `M=1, B=1, H=8, d_k=64, K=4, L=4`, giving `N=8` streams and `S=64` buckets.
-Forward pass only.
+Measured on a single NVIDIA A100-SXM4-40GB (42.4 GB reported, compute capability 8.0) with torch 2.11.0+cu128, timing the forward pass only.
+The configuration is `M=1, B=1, H=8, d_k=64, K=4, L=4`, which gives `N=8` streams and `S=64` buckets.
 The notebook with these outputs is [`benchmarks/phase1_baseline.ipynb`](benchmarks/phase1_baseline.ipynb).
 
 At this configuration one timestep of `B_pref` costs `N * S * d_k * 4` bytes, so that one tensor grows by **128 KB per token**.
-That figure is arithmetic on the config, not a measurement; the measured number is below.
+That figure is arithmetic on the config; the measured number comes from the sweep below.
 
 ```
         T |    fwd ms |  peak GB |  M tok/s
@@ -79,50 +76,42 @@ That figure is arithmetic on the config, not a measurement; the measured number 
    131072 |  OUT OF MEMORY  <-- this is the baseline's wall
 ```
 
-Three things to take from this.
-
 Peak memory is almost perfectly linear in `T`, doubling with every doubling of the sequence.
-Dividing peak by `T` gives 277 KB per token at T=4096 and still 277 KB per token at T=65536, so the constant is genuinely flat across a 16x range and there is no quadratic term.
+Dividing peak by `T` gives 277 KB per token at T=4096 and still 277 KB per token at T=65536, so the constant stays flat across a 16x range and there is no quadratic term.
 RACE's linear-time claim holds; the problem is the size of that constant.
 
-Worth noting that 277 KB is about 2.17x the 128 KB that a single `B_pref` costs, and the ratio holds to three significant figures at every length measured.
+The 277 KB figure is also about 2.17x the 128 KB that a single `B_pref` costs, and the ratio holds to three significant figures at every length measured.
 `B_pref` alone does not explain the peak, but a small fixed number of same-shape tensors alive at once does, which is what the code does: the broadcast product, the `cumsum` result, `E_pref`, and the `.contiguous()` copy.
 This is consistent with the trace, though attributing the exact 2.17 to specific allocations would need a memory profile that has not been run yet.
 
 Throughput plateaus at about **5.25 M tokens/s** from T=16384 onward and does not improve with more work in flight.
 A compute-bound kernel would usually keep climbing as the sequence gets long enough to saturate the GPU.
-Flattening this early is the signature of a memory-bound loop, which is consistent with a hot path whose main activity is writing and re-reading a large scratch tensor.
+Flattening out this early usually points to a memory-bound loop, and that fits a hot path that spends most of its time writing and re-reading a large scratch tensor.
 
 The wall is at **T=131072**.
-The last sequence length that fits is 65536, at 18.60 GB peak.
-Doubling to 131072 would need roughly 37 GB for the prefix tensors alone on a 40 GB card, and it fails.
+The last sequence length that fits is 65536, at 18.60 GB peak; doubling to 131072 would need roughly 37 GB for the prefix tensors alone on a 40 GB card, and it fails.
 
-These numbers are the "before" picture.
-Every later performance claim in this repository will be measured against them on the same hardware.
+These are the "before" numbers.
+Later performance claims in this repository are measured against them on the same hardware.
 
 ## Roadmap
 
-**Phase 1 - baseline measurement.**
-Done.
-Reproduce the reference causal forward faithfully, sweep sequence length, and record time, peak memory, and throughput up to the OOM point.
-That is the table above.
+Phase 1 (baseline measurement) is done.
+It reproduces the reference causal forward faithfully, sweeps sequence length, and records time, peak memory, and throughput up to the OOM point; the table above is the output.
 
-**Phase 2 - memory-light PyTorch reference.**
-Done.
+Phase 2 (a memory-light PyTorch reference) is also done.
 `src/race_chunked.py` carries the running `A` and `B` state across chunks and never builds `B_pref`.
 `src/test_equivalence.py` checks it against a faithful copy of the reference (`src/race_baseline.py`): max difference about 1e-7 in fp32, 2e-15 in fp64, and bit-identical when the chunk is the whole sequence.
 `src/bench_cpu_memory.py` shows the reference growing by about 267 KB per token in peak RSS while the chunked version stays flat.
 
-**Phase 3 - fused CUDA kernel.**
-Running and measured; tensor-core version next.
-There are two causal kernels.
+Phase 3 is the fused CUDA kernel, which is running and measured, with a tensor-core version next.
+It has two causal kernels.
 `src/race_fused_fwd.cu` is the direct prototype: one block per stream, bucket state in shared memory, bf16 in and out, fp32 accumulation, no atomics.
 It removes the prefix tensor but walks each stream sequentially, so at the benchmarked config it keeps 8 of an A100's 108 SMs busy.
 `src/causal_v2/` is the parallel version: tiles are summed by the non-causal bucket build, a per-stream scan turns tile sums into prefix states, and an output kernel per tile handles the causal part in 64-token sub-chunks.
 The design with the arithmetic behind the tile and sub-chunk sizes is in `docs/causal_v2_design.md`.
 
-**Non-causal forward and backward.**
-Running and measured; tensor-core version next.
+The non-causal forward and backward are at the same stage: running and measured, with a tensor-core version next.
 `src/noncausal/` implements the paper's Algorithm 1 as three kernels (per-tile bucket build, fixed-order tree reduce, query pass) plus a five-launch backward with an `autograd.Function` wrapper.
 The corner probabilities use the exact product form φᵣ = ∏ₜ [pₜ or 1 − pₜ] with pₜ = σ(2βuₜ), so there is no length-R softmax anywhere.
 Every reduction is a fixed-shape tree, which makes forward and backward bitwise reproducible run to run.
@@ -135,7 +124,7 @@ Everything under `src/` has run on five GPUs: an A10G, an L4, an L40S, an A100-S
 compute-sanitizer reports no memory errors on any of them, and every kernel compiles for sm_80, sm_86, sm_89 and sm_90 with no register spills.
 The reports are [`benchmarks/a10g_first_run.md`](benchmarks/a10g_first_run.md), [`benchmarks/a100_first_run.md`](benchmarks/a100_first_run.md), [`benchmarks/a100_tensor_cores.md`](benchmarks/a100_tensor_cores.md), [`benchmarks/l40s_run.md`](benchmarks/l40s_run.md) and [`benchmarks/h100_run.md`](benchmarks/h100_run.md).
 
-The headline against the baseline table above, on the A100-40GB where the reference runs out of memory at T = 131072:
+Compared with the baseline table above, on the A100-40GB where the reference runs out of memory at T = 131072:
 
 | causal forward, d = 64, P = 4, L = 4, 8 streams | T = 2097152 |
 |---|---|
@@ -146,9 +135,9 @@ The headline against the baseline table above, on the A100-40GB where the refere
 
 So the 2M-token forward runs in 8 GiB, 16x past the reference's wall, at 160x the throughput of the memory-light PyTorch version and about 680x the prototype.
 
-Bandwidth: the non-causal tensor-core forward reaches 80% of the A100's HBM peak at P = 2, L = 2 and 52% at P = 4, L = 4, up from 38% and 9% on fp32 cores.
+For bandwidth, the non-causal tensor-core forward reaches 80% of the A100's HBM peak at P = 2, L = 2 and 52% at P = 4, L = 4, up from 38% and 9% on fp32 cores.
 The causal tensor-core kernel reaches 38% of peak counting the bytes it actually moves, up from 9%.
-On an L40S, which has 56% of the A100's bandwidth for a similar compute rate, the same kernels run at 77-84% of peak at every configuration and the 2M-token causal forward takes 18.6 ms, so the A100 gap is the kernel's remaining CUDA-core phases and barriers rather than memory.
+On an L40S, which has 56% of the A100's bandwidth for a similar compute rate, the same kernels run at 77-84% of peak at every configuration and the 2M-token causal forward takes 18.6 ms, so what holds the A100 back is the kernel's remaining CUDA-core phases and barriers.
 On an H100 the 2M-token causal forward takes 14.7 ms and the non-causal forward reaches 64% of that GPU's 3.35 TB/s at P = 2, L = 2; the profile there shows the causal output kernel latency-bound at 24% occupancy, which is what the mma.sync rewrite would address.
 The three heavy stages (hash projection, bucket accumulation, query mixing) run on wmma bf16 fragments with fp32 accumulation, with the hash planes and the bucket state split into bf16 hi + lo pairs so the projection and the carry keep fp32-level accuracy; the tolerance derivations are in the tests.
 The fp32-core paths remain the defaults until a training run shows the bf16 rounding of the hash weights is harmless.
