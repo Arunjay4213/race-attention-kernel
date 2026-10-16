@@ -132,7 +132,7 @@ The design is in `docs/noncausal_design.md`.
 ## Status
 
 Everything under `src/` has run on five GPUs: an A10G, an L4, an L40S, an A100-SXM4-40GB (the same model as the Phase 1 baseline), and an H100 80GB.
-All test suites pass on each (2170 non-causal, 1717 causal on the A100), compute-sanitizer reports nothing, and every kernel compiles for sm_80, sm_86, sm_89 and sm_90 with no register spills.
+compute-sanitizer reports no memory errors on any of them, and every kernel compiles for sm_80, sm_86, sm_89 and sm_90 with no register spills.
 The reports are [`benchmarks/a10g_first_run.md`](benchmarks/a10g_first_run.md), [`benchmarks/a100_first_run.md`](benchmarks/a100_first_run.md), [`benchmarks/a100_tensor_cores.md`](benchmarks/a100_tensor_cores.md), [`benchmarks/l40s_run.md`](benchmarks/l40s_run.md) and [`benchmarks/h100_run.md`](benchmarks/h100_run.md).
 
 The headline against the baseline table above, on the A100-40GB where the reference runs out of memory at T = 131072:
